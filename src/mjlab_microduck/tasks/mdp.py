@@ -6856,7 +6856,7 @@ def roller_hop_tilt_penalty(
 
 
 # ==============================================================================
-# Roller backflip — airborne reverse curriculum from a curated arena motion
+# Roller front flip — legacy ``backflip`` IDs retained for checkpoint compatibility
 # ==============================================================================
 
 def _roller_backflip_state(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, ...]:
@@ -6905,7 +6905,7 @@ def reset_roller_backflip_state(
     assist_omega_range: tuple[float, float] = (10.0, 15.0),
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> None:
-    """Mix standing assisted starts with states from the accepted backflip.
+    """Mix standing assisted starts with states from the accepted front flip.
 
     The demonstration is used only as a reverse-curriculum reset distribution;
     no time-indexed waypoint reward is present. Assistance is applied as root
@@ -7015,7 +7015,7 @@ def roller_backflip_rotation_progress(
     target_rotation: float = 2 * math.pi,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Potential-based payment for new airborne backward rotation."""
+    """Potential-based payment for new airborne forward rotation (+body Y)."""
     _, maximum, paid, *_ = _update_roller_backflip_state(
         env, feet_sensor_name, body_sensor_name, stand_height,
         takeoff_clearance, landing_rotation, asset_cfg,

@@ -1,4 +1,8 @@
-"""Rolling roller-backflip learned from an accepted arena demonstration.
+"""Rolling roller front flip learned from an accepted arena demonstration.
+
+The module and task IDs retain ``backflip`` for checkpoint compatibility. In
+MicroDuck's coordinate convention positive body-Y pitch is nose-down/forward,
+so this environment trains a front flip.
 
 The demonstration is a reverse-curriculum reset distribution, not a keyframe
 reward: PPO must discover controls that satisfy state-based takeoff, airborne
@@ -61,7 +65,7 @@ def _normalized(values: list[float]) -> tuple[float, ...]:
 
 
 def load_backflip_demonstration(path: Path = _DEMO_PATH) -> dict:
-    """Extract safe reset tensors and cumulative pitch from the curated clip."""
+    """Extract front-flip reset tensors and cumulative forward pitch."""
     document = json.loads(path.read_text())
     if not document.get("curation", {}).get("accepted"):
         raise ValueError(f"Backflip demonstration is not accepted: {path}")
