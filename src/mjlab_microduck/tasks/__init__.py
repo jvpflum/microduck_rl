@@ -51,6 +51,10 @@ from .microduck_roller_crouch_env_cfg import (
     make_microduck_roller_crouch_env_cfg,
     MicroduckRollerCrouchRlCfg,
 )
+from .microduck_roller_hop_env_cfg import (
+    make_microduck_roller_hop_env_cfg,
+    MicroduckRollerHopRlCfg,
+)
 from .microduck_roller_slope_env_cfg import (
     make_microduck_roller_slope_env_cfg,
     MicroduckRollerSlopeRlCfg,
@@ -190,6 +194,15 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
+# Roller HOP — stationary two-skate takeoff and controlled two-skate landing.
+register_mjlab_task(
+    task_id="Mjlab-RollerHop-Flat-MicroDuck",
+    env_cfg=make_microduck_roller_hop_env_cfg(),
+    play_env_cfg=make_microduck_roller_hop_env_cfg(play=True),
+    rl_cfg=MicroduckRollerHopRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
 register_mjlab_task(
     task_id="Mjlab-RollerSlope-Flat-MicroDuck",
     env_cfg=make_microduck_roller_slope_env_cfg(),
@@ -258,6 +271,7 @@ _BACKLASH_TASKS = (
     ("Mjlab-Velocity-Flat-Backlash-MicroDuck-Rollers", make_microduck_velocity_rollers_env_cfg, {}, MicroduckRollersRlCfg, _BL_ROLLERS),
     ("Mjlab-Velocity-Swizzle-Backlash-MicroDuck", make_microduck_velocity_swizzle_env_cfg, {}, MicroduckSwizzleRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerCrouch-Flat-Backlash-MicroDuck", make_microduck_roller_crouch_env_cfg, {}, MicroduckRollerCrouchRlCfg, _BL_ROLLERS),
+    ("Mjlab-RollerHop-Flat-Backlash-MicroDuck", make_microduck_roller_hop_env_cfg, {}, MicroduckRollerHopRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerSlope-Flat-Backlash-MicroDuck", make_microduck_roller_slope_env_cfg, {}, MicroduckRollerSlopeRlCfg, _BL_ROLLERS),
 )
 for _task_id, _make_cfg, _kw, _rl_cfg, _robot_cfg in _BACKLASH_TASKS:

@@ -6591,6 +6591,270 @@ def trunk_upward_velocity_penalty(
     asset = env.scene[asset_cfg.name]
     vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
     return -torch.clamp(vz - max_up_vel, min=0.0)
+
+
+# ==============================================================================
+# Roller hop task — one-shot, state-gated jump and landing
+# ==============================================================================
+
+
+def _roller_hop_state(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, ...]:
+    """Create and return the per-environment hop progress buffers."""
+    size = env.num_envs
+    device = env.device
+    peak = getattr(env, "_roller_hop_peak_clearance", None)
+    if peak is None or peak.shape[0] != size:
+        env._roller_hop_peak_clearance = torch.zeros(size, device=device)
+        env._roller_hop_paid_clearance = torch.zeros(size, device=device)
+        env._roller_hop_support_latch = torch.zeros(size, dtype=torch.bool, device=device)
+        env._roller_hop_takeoff_latch = torch.zeros(size, dtype=torch.bool, device=device)
+        env._roller_hop_landing_latch = torch.zeros(size, dtype=torch.bool, device=device)
+        env._roller_hop_last_update_step = -1
+    return (
+        env._roller_hop_peak_clearance,
+        env._roller_hop_paid_clearance,
+        env._roller_hop_support_latch,
+        env._roller_hop_takeoff_latch,
+        env._roller_hop_landing_latch,
+    )
+
+
+def reset_roller_hop_state(env: ManagerBasedRlEnv, env_ids: torch.Tensor) -> None:
+    """Reset hop latches and potential accounting for newly reset episodes."""
+    peak, paid, supported, takeoff, landed = _roller_hop_state(env)
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    else:
+        env_ids = env_ids.to(env.device, dtype=torch.long)
+    peak[env_ids] = 0.0
+    paid[env_ids] = 0.0
+    supported[env_ids] = False
+    takeoff[env_ids] = False
+    landed[env_ids] = False
+    # A reset can happen between reward calls at the same global step.
+    env._roller_hop_last_update_step = -1
+
+
+def _roller_foot_contact_masks(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(both_contact, both_airborne)`` from a two-skate sensor."""
+    sensor = env.scene.sensors.get(sensor_name)
+    if sensor is None:
+        zeros = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        return zeros, zeros
+
+    contact_time = sensor.data.current_contact_time
+    air_time = sensor.data.current_air_time
+    if contact_time is not None and air_time is not None:
+        contact = contact_time.reshape(env.num_envs, -1) > 0.0
+        airborne = air_time.reshape(env.num_envs, -1) > env.step_dt
+        return contact.all(dim=-1), airborne.all(dim=-1)
+
+    found = sensor.data.found.reshape(env.num_envs, -1).bool()
+    return found.all(dim=-1), (~found).all(dim=-1)
+
+
+def _update_roller_hop_state(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    stand_height: float,
+    latch_clearance: float,
+    asset_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, ...]:
+    """Update takeoff/landing latches once per control step."""
+    asset: Entity = env.scene[asset_cfg.name]
+    peak, paid, supported, takeoff, landed = _roller_hop_state(env)
+    step = int(env.common_step_counter)
+    if step != env._roller_hop_last_update_step:
+        z = torch.nan_to_num(
+            asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+            nan=0.0,
+        )
+        both_contact, both_airborne = _roller_foot_contact_masks(env, sensor_name)
+        supported |= both_contact
+        clearance = torch.clamp(z - stand_height, min=0.0)
+        # Require grounded support earlier in this episode. The roller model is
+        # spawned a few millimetres above the plane to avoid penetration; that
+        # initial settling fall must never masquerade as a successful jump.
+        valid_takeoff = supported & both_airborne & (clearance >= latch_clearance)
+        takeoff |= valid_takeoff
+        env._roller_hop_peak_clearance = torch.maximum(
+            peak, torch.where(takeoff & both_airborne, clearance, torch.zeros_like(clearance))
+        )
+        # A landing is only valid after real flight. Standing at reset can never
+        # unlock the landing annuity.
+        landed |= takeoff & both_contact
+        env._roller_hop_last_update_step = step
+    return (
+        env._roller_hop_peak_clearance,
+        env._roller_hop_paid_clearance,
+        env._roller_hop_support_latch,
+        env._roller_hop_takeoff_latch,
+        env._roller_hop_landing_latch,
+    )
+
+
+def _phase_window(
+    phase: torch.Tensor,
+    start: float,
+    end: float,
+    fade: float = 0.04,
+) -> torch.Tensor:
+    """Smooth non-wrapping phase window in ``[0, 1)``."""
+    fade = min(fade, max((end - start) * 0.5, 1e-6))
+    rise = torch.clamp((phase - start) / fade, 0.0, 1.0)
+    fall = torch.clamp((end - phase) / fade, 0.0, 1.0)
+    rise = rise * rise * (3.0 - 2.0 * rise)
+    fall = fall * fall * (3.0 - 2.0 * fall)
+    return rise * fall
+
+
+def roller_hop_load_height(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    std: float = 0.02,
+    command_name: str = "twist",
+    phase_start: float = 0.08,
+    phase_end: float = 0.34,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward a compact, upright preload during the loading window."""
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    gate = _phase_window(_gp_phase(env, command_name), phase_start, phase_end)
+    return gate * torch.exp(-((z - target_height) / std) ** 2)
+
+
+def roller_hop_takeoff_velocity(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    max_vz: float = 0.45,
+    command_name: str = "twist",
+    phase_start: float = 0.25,
+    phase_end: float = 0.52,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Pay controlled upward speed while both skates are still pushing."""
+    asset: Entity = env.scene[asset_cfg.name]
+    both_contact, _ = _roller_foot_contact_masks(env, sensor_name)
+    vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
+    gate = _phase_window(_gp_phase(env, command_name), phase_start, phase_end)
+    return gate * both_contact.float() * torch.clamp(vz / max(max_vz, 1e-6), 0.0, 1.0)
+
+
+def roller_hop_clearance_progress(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    stand_height: float,
+    target_clearance: float,
+    latch_clearance: float = 0.004,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Potential-based, one-time payment for true airborne clearance."""
+    peak, paid, _, _, _ = _update_roller_hop_state(
+        env, sensor_name, stand_height, latch_clearance, asset_cfg
+    )
+    frontier = torch.clamp(peak, max=target_clearance)
+    delta = torch.clamp(frontier - paid, min=0.0)
+    env._roller_hop_paid_clearance = torch.maximum(paid, frontier)
+    return delta / (max(target_clearance, 1e-6) * env.step_dt)
+
+
+def roller_hop_flight_upright(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    stand_height: float,
+    latch_clearance: float = 0.004,
+    upright_std: float = 0.25,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Keep the trunk vertical, but only after the hop has actually begun."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _, both_airborne = _roller_foot_contact_masks(env, sensor_name)
+    _, _, _, takeoff, _ = _update_roller_hop_state(
+        env, sensor_name, stand_height, latch_clearance, asset_cfg
+    )
+    quat = asset.data.root_link_quat_w
+    tilt_sq = 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+    return takeoff.float() * both_airborne.float() * torch.exp(
+        -tilt_sq / (upright_std * upright_std)
+    )
+
+
+def roller_hop_landing_composite(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    stand_height: float,
+    height_std: float,
+    upright_std: float,
+    pose_std: float,
+    joint_indices: list,
+    latch_clearance: float = 0.004,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Standing goal score, unlocked only by a completed airborne hop."""
+    _, _, _, _, landed = _update_roller_hop_state(
+        env, sensor_name, stand_height, latch_clearance, asset_cfg
+    )
+    both_contact, _ = _roller_foot_contact_masks(env, sensor_name)
+    score = standing_composite_score(
+        env,
+        target_height=stand_height,
+        height_std=height_std,
+        upright_std=upright_std,
+        pose_std=pose_std,
+        joint_indices=joint_indices,
+        asset_cfg=asset_cfg,
+    )
+    return score * landed.float() * both_contact.float()
+
+
+def roller_hop_landing_stillness(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    stand_height: float,
+    latch_clearance: float = 0.004,
+    linear_std: float = 0.08,
+    angular_std: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward a quiet two-skate landing after the takeoff latch opens."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _, _, _, _, landed = _update_roller_hop_state(
+        env, sensor_name, stand_height, latch_clearance, asset_cfg
+    )
+    both_contact, _ = _roller_foot_contact_masks(env, sensor_name)
+    lin = torch.nan_to_num(asset.data.root_link_lin_vel_w, nan=0.0).norm(dim=-1)
+    ang = torch.nan_to_num(asset.data.root_link_ang_vel_b, nan=0.0).norm(dim=-1)
+    quiet = torch.exp(-((lin / linear_std) ** 2) - ((ang / angular_std) ** 2))
+    return quiet * landed.float() * both_contact.float()
+
+
+def roller_hop_horizontal_drift_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Squared horizontal body speed; positive cost for a negative weight."""
+    asset: Entity = env.scene[asset_cfg.name]
+    velocity = torch.nan_to_num(asset.data.root_link_lin_vel_b[:, :2], nan=0.0)
+    return torch.sum(velocity.pow(2), dim=-1)
+
+
+def roller_hop_tilt_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Zero upright, increasing toward 2 when inverted; use a negative weight."""
+    asset: Entity = env.scene[asset_cfg.name]
+    quat = asset.data.root_link_quat_w
+    cos_tilt = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+    return torch.clamp(1.0 - torch.nan_to_num(cos_tilt, nan=-1.0), 0.0, 2.0)
+
+
 # ==============================================================================
 # Roulade (forward roll) task — episodic dynamic maneuver
 # ==============================================================================
