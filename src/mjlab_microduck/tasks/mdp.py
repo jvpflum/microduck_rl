@@ -6856,6 +6856,249 @@ def roller_hop_tilt_penalty(
 
 
 # ==============================================================================
+# Roller backflip — airborne reverse curriculum from a curated arena motion
+# ==============================================================================
+
+def _roller_backflip_state(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, ...]:
+    """Create the potential, contact, and completion buffers."""
+    if not hasattr(env, "_roller_backflip_accum"):
+        z = torch.zeros(env.num_envs, device=env.device)
+        b = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._roller_backflip_accum = z.clone()
+        env._roller_backflip_max = z.clone()
+        env._roller_backflip_paid = z.clone()
+        env._roller_backflip_peak_clearance = z.clone()
+        env._roller_backflip_paid_clearance = z.clone()
+        env._roller_backflip_supported = b.clone()
+        env._roller_backflip_takeoff = b.clone()
+        env._roller_backflip_landed = b.clone()
+        env._roller_backflip_invalid = b.clone()
+        env._roller_backflip_just_landed = b.clone()
+        env._roller_backflip_last_update_step = -1
+    return (
+        env._roller_backflip_accum,
+        env._roller_backflip_max,
+        env._roller_backflip_paid,
+        env._roller_backflip_peak_clearance,
+        env._roller_backflip_paid_clearance,
+        env._roller_backflip_supported,
+        env._roller_backflip_takeoff,
+        env._roller_backflip_landed,
+        env._roller_backflip_invalid,
+        env._roller_backflip_just_landed,
+    )
+
+
+def _contact_any(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+    sensor = env.scene.sensors.get(sensor_name)
+    if sensor is None or sensor.data.found is None:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    return sensor.data.found.reshape(env.num_envs, -1).bool().any(dim=-1)
+
+
+def reset_roller_backflip_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    demonstration: dict,
+    demo_prob: float = 0.65,
+    assist_vz_range: tuple[float, float] = (0.6, 0.9),
+    assist_omega_range: tuple[float, float] = (10.0, 15.0),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Mix standing assisted starts with states from the accepted backflip.
+
+    The demonstration is used only as a reverse-curriculum reset distribution;
+    no time-indexed waypoint reward is present. Assistance is applied as root
+    velocity at reset and is scheduled to zero by the environment curriculum.
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    asset: Entity = env.scene[asset_cfg.name]
+    state = _roller_backflip_state(env)
+    accum, maximum, paid, peak, paid_clear, supported, takeoff, landed, invalid, just_landed = state
+    for values in state[:5]:
+        values[env_ids] = 0.0
+    for values in state[5:]:
+        values[env_ids] = False
+
+    cache_key = "_roller_backflip_demo_cache"
+    cache = getattr(env, cache_key, None)
+    if cache is None:
+        cache = {
+            key: torch.as_tensor(value, dtype=torch.float32, device=env.device)
+            for key, value in demonstration.items()
+        }
+        setattr(env, cache_key, cache)
+
+    is_demo = torch.rand(len(env_ids), device=env.device) < demo_prob
+    demo_env_ids = env_ids[is_demo]
+    stand_env_ids = env_ids[~is_demo]
+    servo_ids = _servo_joint_ids(env, asset)
+
+    if len(demo_env_ids) > 0:
+        sample = torch.randint(len(cache["progress"]), (len(demo_env_ids),), device=env.device)
+        env.sim.data.qpos[demo_env_ids, 2] = cache["root_qpos"][sample, 2]
+        env.sim.data.qpos[demo_env_ids, 3:7] = cache["root_qpos"][sample, 3:7]
+        env.sim.data.qvel[demo_env_ids, :6] = cache["root_qvel"][sample]
+        qpos_cols = torch.as_tensor([7 + index for index in servo_ids], device=env.device)
+        qvel_cols = torch.as_tensor([6 + index for index in servo_ids], device=env.device)
+        env.sim.data.qpos[demo_env_ids.unsqueeze(1), qpos_cols.unsqueeze(0)] = cache["joint_pos"][sample]
+        env.sim.data.qvel[demo_env_ids.unsqueeze(1), qvel_cols.unsqueeze(0)] = cache["joint_vel"][sample]
+        progress = cache["progress"][sample]
+        accum[demo_env_ids] = progress
+        maximum[demo_env_ids] = progress
+        paid[demo_env_ids] = progress
+        supported[demo_env_ids] = True
+        takeoff[demo_env_ids] = True
+
+    if len(stand_env_ids) > 0:
+        env.sim.data.qvel[stand_env_ids, 2] = (
+            torch.rand(len(stand_env_ids), device=env.device)
+            * (assist_vz_range[1] - assist_vz_range[0])
+            + assist_vz_range[0]
+        )
+        env.sim.data.qvel[stand_env_ids, 4] = (
+            torch.rand(len(stand_env_ids), device=env.device)
+            * (assist_omega_range[1] - assist_omega_range[0])
+            + assist_omega_range[0]
+        )
+        supported[stand_env_ids] = True
+    env._roller_backflip_last_update_step = -1
+
+
+def _update_roller_backflip_state(
+    env: ManagerBasedRlEnv,
+    feet_sensor_name: str,
+    body_sensor_name: str,
+    stand_height: float,
+    takeoff_clearance: float,
+    landing_rotation: float,
+    asset_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, ...]:
+    asset: Entity = env.scene[asset_cfg.name]
+    state = _roller_backflip_state(env)
+    accum, maximum, _, peak, _, supported, takeoff, landed, invalid, just_landed = state
+    step = int(env.common_step_counter)
+    if step == env._roller_backflip_last_update_step:
+        return state
+
+    both_contact, both_airborne = _roller_foot_contact_masks(env, feet_sensor_name)
+    supported |= both_contact
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    clearance = torch.clamp(z - stand_height, min=0.0)
+    takeoff |= supported & both_airborne & (clearance >= takeoff_clearance)
+    active_flight = takeoff & both_airborne & ~invalid
+    omega_y = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 1], nan=0.0)
+    env._roller_backflip_accum = accum + active_flight.float() * torch.clamp(omega_y, min=0.0) * env.step_dt
+    env._roller_backflip_max = torch.maximum(maximum, env._roller_backflip_accum)
+    env._roller_backflip_peak_clearance = torch.maximum(
+        peak, torch.where(active_flight, clearance, torch.zeros_like(clearance))
+    )
+    invalid |= takeoff & _contact_any(env, body_sensor_name)
+    candidate = takeoff & both_contact & (env._roller_backflip_max >= landing_rotation) & ~invalid
+    just_landed[:] = candidate & ~landed
+    landed |= candidate
+    env._roller_backflip_last_update_step = step
+    return _roller_backflip_state(env)
+
+
+def roller_backflip_rotation_progress(
+    env: ManagerBasedRlEnv,
+    feet_sensor_name: str,
+    body_sensor_name: str,
+    stand_height: float,
+    takeoff_clearance: float,
+    landing_rotation: float,
+    target_rotation: float = 2 * math.pi,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Potential-based payment for new airborne backward rotation."""
+    _, maximum, paid, *_ = _update_roller_backflip_state(
+        env, feet_sensor_name, body_sensor_name, stand_height,
+        takeoff_clearance, landing_rotation, asset_cfg,
+    )
+    frontier = torch.clamp(maximum, max=target_rotation)
+    delta = torch.clamp(frontier - paid, min=0.0)
+    env._roller_backflip_paid = torch.maximum(paid, frontier)
+    return delta / (max(target_rotation, 1e-6) * env.step_dt)
+
+
+def roller_backflip_clearance_progress(
+    env: ManagerBasedRlEnv,
+    feet_sensor_name: str,
+    body_sensor_name: str,
+    stand_height: float,
+    takeoff_clearance: float,
+    landing_rotation: float,
+    target_clearance: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """One-time potential payment for airborne clearance."""
+    _, _, _, peak, paid, *_ = _update_roller_backflip_state(
+        env, feet_sensor_name, body_sensor_name, stand_height,
+        takeoff_clearance, landing_rotation, asset_cfg,
+    )
+    frontier = torch.clamp(peak, max=target_clearance)
+    delta = torch.clamp(frontier - paid, min=0.0)
+    env._roller_backflip_paid_clearance = torch.maximum(paid, frontier)
+    return delta / (max(target_clearance, 1e-6) * env.step_dt)
+
+
+def roller_backflip_landing(
+    env: ManagerBasedRlEnv,
+    feet_sensor_name: str,
+    body_sensor_name: str,
+    stand_height: float,
+    takeoff_clearance: float,
+    landing_rotation: float,
+    joint_indices: list,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """One-time controlled upright landing reward after a valid full flip."""
+    asset: Entity = env.scene[asset_cfg.name]
+    *_, just_landed = _update_roller_backflip_state(
+        env, feet_sensor_name, body_sensor_name, stand_height,
+        takeoff_clearance, landing_rotation, asset_cfg,
+    )
+    pose = standing_composite_score(
+        env, target_height=stand_height, height_std=0.03,
+        upright_std=0.3, pose_std=0.5, joint_indices=joint_indices,
+        asset_cfg=asset_cfg,
+    )
+    lin = torch.nan_to_num(asset.data.root_link_lin_vel_w, nan=0.0).norm(dim=-1)
+    ang = torch.nan_to_num(asset.data.root_link_ang_vel_b, nan=0.0).norm(dim=-1)
+    quiet = torch.exp(-((lin / 0.35) ** 2) - ((ang / 3.0) ** 2))
+    return just_landed.float() * pose * quiet / env.step_dt
+
+
+def roller_backflip_body_contact_cost(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+    return _contact_any(env, sensor_name).float()
+
+
+def roller_backflip_sagittal_cost(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    ang = torch.nan_to_num(asset.data.root_link_ang_vel_b, nan=0.0)
+    lin = torch.nan_to_num(asset.data.root_link_lin_vel_b, nan=0.0)
+    return ang[:, 0].pow(2) + ang[:, 2].pow(2) + 4.0 * lin[:, 1].pow(2)
+
+
+def roller_backflip_overspeed_cost(
+    env: ManagerBasedRlEnv,
+    max_pitch_rate: float = 22.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    omega = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 1], nan=0.0).abs()
+    return torch.clamp(omega - max_pitch_rate, min=0.0).pow(2)
+
+
+# ==============================================================================
 # Roulade (forward roll) task — episodic dynamic maneuver
 # ==============================================================================
 #
