@@ -43,6 +43,42 @@ from .microduck_velocity_rollers_env_cfg import (
     make_microduck_velocity_rollers_env_cfg,
     MicroduckRollersRlCfg,
 )
+from .microduck_velocity_sprint_env_cfg import (
+    make_microduck_velocity_sprint_env_cfg,
+    MicroduckSprintRlCfg,
+)
+from .microduck_velocity_race_env_cfg import (
+    make_microduck_velocity_race_env_cfg,
+    MicroduckRaceRlCfg,
+)
+from .microduck_velocity_race5_env_cfg import (
+    make_microduck_velocity_race5_env_cfg,
+    MicroduckRace5RlCfg,
+)
+from .microduck_speed_discovery_env_cfg import (
+    make_microduck_speed_discovery_env_cfg,
+    MicroduckSpeedDiscoveryRlCfg,
+)
+from .microduck_speed_straightening_env_cfg import (
+    make_microduck_speed_straightening_env_cfg,
+    MicroduckSpeedStraighteningRlCfg,
+)
+from .microduck_speed_retention_env_cfg import (
+    make_microduck_speed_retention_env_cfg,
+    MicroduckSpeedRetentionRlCfg,
+)
+from .microduck_speed_retention_boost_env_cfg import (
+    make_microduck_speed_retention_boost_env_cfg,
+    MicroduckSpeedRetentionBoostRlCfg,
+)
+from .microduck_speed_friction_transfer_env_cfg import (
+    make_microduck_speed_friction_transfer_env_cfg,
+    MicroduckSpeedFrictionTransferRlCfg,
+)
+from .microduck_speed_command_breakthrough_env_cfg import (
+    make_microduck_speed_command_breakthrough_env_cfg,
+    MicroduckSpeedCommandBreakthroughRlCfg,
+)
 from .microduck_velocity_swizzle_env_cfg import (
     make_microduck_velocity_swizzle_env_cfg,
     MicroduckSwizzleRlCfg,
@@ -181,6 +217,83 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
+# Roller SPRINT — straight-line target-speed specialist.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Sprint-MicroDuck",
+    env_cfg=make_microduck_velocity_sprint_env_cfg(),
+    play_env_cfg=make_microduck_velocity_sprint_env_cfg(play=True),
+    rl_cfg=MicroduckSprintRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller RACE — fixed-distance, uncapped forward-speed specialist.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Race-MicroDuck",
+    env_cfg=make_microduck_velocity_race_env_cfg(),
+    play_env_cfg=make_microduck_velocity_race_env_cfg(play=True),
+    rl_cfg=MicroduckRaceRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller RACE5 — 5 mph target with a 10 mph simulation stretch cap.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Race5-MicroDuck",
+    env_cfg=make_microduck_velocity_race5_env_cfg(),
+    play_env_cfg=make_microduck_velocity_race5_env_cfg(play=True),
+    rl_cfg=MicroduckRace5RlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller SPEED DISCOVERY — nominal physics and unconstrained chassis velocity.
+register_mjlab_task(
+    task_id="Mjlab-SpeedDiscovery-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_discovery_env_cfg(),
+    play_env_cfg=make_microduck_speed_discovery_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedDiscoveryRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller SPEED STRAIGHTENING — retain the fast gait while restoring race line.
+register_mjlab_task(
+    task_id="Mjlab-SpeedStraightening-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_straightening_env_cfg(),
+    play_env_cfg=make_microduck_speed_straightening_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedStraighteningRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedRetention-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_retention_env_cfg(),
+    play_env_cfg=make_microduck_speed_retention_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedRetentionRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedRetentionBoost-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_retention_boost_env_cfg(),
+    play_env_cfg=make_microduck_speed_retention_boost_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedRetentionBoostRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedFrictionTransfer-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_friction_transfer_env_cfg(),
+    play_env_cfg=make_microduck_speed_friction_transfer_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedFrictionTransferRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedCommandBreakthrough-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_command_breakthrough_env_cfg(),
+    play_env_cfg=make_microduck_speed_command_breakthrough_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedCommandBreakthroughRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
 # Roller SWIZZLE task — clean classic swizzle (symmetric, feet grounded).
 register_mjlab_task(
     task_id="Mjlab-Velocity-Swizzle-MicroDuck",
@@ -282,6 +395,10 @@ _BACKLASH_TASKS = (
     ("Mjlab-GroundPick-Rough-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {"rough": True}, MicroduckGroundPickRlCfg, _BL_ALLCOL),
     ("Mjlab-BallKick-Flat-Backlash-MicroDuck", make_microduck_ball_kick_env_cfg, {}, MicroduckBallKickRlCfg, _BL_ALLCOL),
     ("Mjlab-Velocity-Flat-Backlash-MicroDuck-Rollers", make_microduck_velocity_rollers_env_cfg, {}, MicroduckRollersRlCfg, _BL_ROLLERS),
+    ("Mjlab-Velocity-Sprint-Backlash-MicroDuck", make_microduck_velocity_sprint_env_cfg, {}, MicroduckSprintRlCfg, _BL_ROLLERS),
+    ("Mjlab-Velocity-Race-Backlash-MicroDuck", make_microduck_velocity_race_env_cfg, {}, MicroduckRaceRlCfg, _BL_ROLLERS),
+    ("Mjlab-Velocity-Race5-Backlash-MicroDuck", make_microduck_velocity_race5_env_cfg, {}, MicroduckRace5RlCfg, _BL_ROLLERS),
+    ("Mjlab-SpeedDiscovery-Flat-Backlash-MicroDuck-Rollers", make_microduck_speed_discovery_env_cfg, {}, MicroduckSpeedDiscoveryRlCfg, _BL_ROLLERS),
     ("Mjlab-Velocity-Swizzle-Backlash-MicroDuck", make_microduck_velocity_swizzle_env_cfg, {}, MicroduckSwizzleRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerCrouch-Flat-Backlash-MicroDuck", make_microduck_roller_crouch_env_cfg, {}, MicroduckRollerCrouchRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerHop-Flat-Backlash-MicroDuck", make_microduck_roller_hop_env_cfg, {}, MicroduckRollerHopRlCfg, _BL_ROLLERS),

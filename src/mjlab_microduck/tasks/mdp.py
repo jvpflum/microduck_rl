@@ -3461,6 +3461,24 @@ def reward_weight(
     return torch.tensor([term_cfg.weight])
 
 
+def reward_param_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_name: str,
+    param_stages: list[dict],
+) -> torch.Tensor:
+    """Step-staged mutation of a live reward term's parameters."""
+    del env_ids
+    term_cfg = env.reward_manager.get_term_cfg(reward_name)
+    current = param_stages[0]["params"]
+    for stage in param_stages:
+        if env.common_step_counter >= stage["step"]:
+            current = stage["params"]
+    term_cfg.params.update(current)
+    first_val = next(iter(current.values()))
+    return torch.tensor(float(first_val) if isinstance(first_val, (int, float)) else 0.0)
+
+
 def com_range_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -3545,6 +3563,7 @@ def velocity_command_ranges_curriculum(
     update_lin_vel_y: bool = True,
     update_ang_vel_z: bool = True,
     forward_only: bool = False,
+    min_forward_velocity: float = 0.0,
 ) -> torch.Tensor:
     """Update velocity command ranges based on training progress.
 
@@ -3587,7 +3606,7 @@ def velocity_command_ranges_curriculum(
 
     # Update command ranges
     if forward_only:
-        cfg.ranges.lin_vel_x = (0.0, current_lin_vel)
+        cfg.ranges.lin_vel_x = (min_forward_velocity, current_lin_vel)
     else:
         cfg.ranges.lin_vel_x = (-current_lin_vel, current_lin_vel)
     if update_lin_vel_y:
@@ -4631,6 +4650,59 @@ class RelativeHeadingVelocityCommandCfg(UniformVelocityCommandCfg):
         return RelativeHeadingVelocityCommand(self, env)
 
 
+class RaceLineVelocityCommand(VelocityCommandCommandOnly):
+    """Expose closed-loop race-line correction through the existing yaw slot.
+
+    The locomotion actor remains a 61D deployable policy. It learns how to
+    turn in response to ``cmd[2]`` while this outer loop uses world heading,
+    cross-track position, and yaw rate to calculate that small correction.
+    This is the same measurable controller used by Policy Bench and the arena.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._env_ref = env
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        super()._resample_command(env_ids)
+        self.vel_command_b[env_ids, 2] = 0.0
+
+    def _update_command(self) -> None:
+        quat = self.robot.data.root_link_quat_w
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        yaw = torch.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+        lateral_error = (
+            self.robot.data.root_link_pos_w[:, 1]
+            - self._env_ref.scene.env_origins[:, 1]
+        )
+        yaw_rate = self.robot.data.root_link_ang_vel_w[:, 2]
+        correction = (
+            -self.cfg.yaw_kp * yaw
+            -self.cfg.lateral_kp * lateral_error
+            -self.cfg.yaw_kd * yaw_rate
+        )
+        self.vel_command_b[:, 2] = torch.nan_to_num(correction).clamp(
+            -self.cfg.max_correction, self.cfg.max_correction
+        )
+
+    def _update_metrics(self) -> None:
+        pass
+
+
+@_dataclass(kw_only=True)
+class RaceLineVelocityCommandCfg(UniformVelocityCommandCfg):
+    yaw_kp: float = 0.55
+    lateral_kp: float = 0.10
+    yaw_kd: float = 0.08
+    max_correction: float = 0.18
+
+    def build(self, env: ManagerBasedRlEnv) -> "RaceLineVelocityCommand":
+        return RaceLineVelocityCommand(self, env)
+
+
 def heading_tracking_reward(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -4747,6 +4819,7 @@ def glide_reward(
     command_name: str,
     vel_ref: float = 0.2,
     stillness_std: float = 5.0,
+    normalize_joint_count: bool = False,
     asset_cfg: SceneEntityCfg = SceneEntityCfg(
         "robot", joint_names=(r".*(hip|knee|ankle).*",)
     ),
@@ -4764,8 +4837,9 @@ def glide_reward(
       the earlier broken glide, which omitted it and let a two-blade swizzle-coast
       farm the reward and regress the gait.
     - forward_gate = clamp(v_fwd,0,vel_ref)/vel_ref → 0 when not moving forward.
-    - stillness = exp(-Σ leg_joint_vel² / stillness_std²) → high only when legs
-      are quiet; a kick (fast joint motion) gets ~0, so only a real glide pays.
+    - stillness = exp(-Σ leg_joint_vel² / stillness_std²) by default. Set
+      ``normalize_joint_count`` to use the mean square, keeping the threshold
+      meaningful when the selected joint group contains many degrees of freedom.
     - active on push/coast only (cmd_x >= 0); silent on brake.
     """
     from mjlab.sensor import ContactSensor
@@ -4779,8 +4853,11 @@ def glide_reward(
         forward_gate = torch.ones(env.num_envs, device=env.device)
 
     asset: Entity = env.scene[asset_cfg.name]
-    joint_vel_sq = torch.sum(
-        torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1
+    joint_vel_square = torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids])
+    joint_vel_sq = (
+        torch.mean(joint_vel_square, dim=1)
+        if normalize_joint_count
+        else torch.sum(joint_vel_square, dim=1)
     )
     stillness = torch.exp(-joint_vel_sq / stillness_std ** 2)
 
