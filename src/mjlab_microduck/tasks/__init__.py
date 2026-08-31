@@ -79,6 +79,10 @@ from .microduck_speed_friction_transfer_env_cfg import (
     make_microduck_speed_friction_transfer_env_cfg,
     MicroduckSpeedFrictionTransferRlCfg,
 )
+from .microduck_speed_scout_transfer_env_cfg import (
+    make_microduck_speed_scout_transfer_env_cfg,
+    MicroduckSpeedScoutTransferRlCfg,
+)
 from .microduck_speed_command_breakthrough_env_cfg import (
     make_microduck_speed_command_breakthrough_env_cfg,
     MicroduckSpeedCommandBreakthroughRlCfg,
@@ -296,6 +300,14 @@ register_mjlab_task(
     env_cfg=make_microduck_speed_friction_transfer_env_cfg(),
     play_env_cfg=make_microduck_speed_friction_transfer_env_cfg(play=True),
     rl_cfg=MicroduckSpeedFrictionTransferRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedScoutTransfer-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_scout_transfer_env_cfg(),
+    play_env_cfg=make_microduck_speed_scout_transfer_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedScoutTransferRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
