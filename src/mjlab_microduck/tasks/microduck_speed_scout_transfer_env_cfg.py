@@ -28,17 +28,17 @@ from mjlab_microduck.tasks.microduck_speed_straightening_env_cfg import (
 # advances the physics.
 SPEED_SCOUT_TRANSFER_STAGES = (
     {"target_speed_mps": 2.25, "wheel_friction": 0.0000,
-     "advance_mean_speed_mps": 1.60, "advance_survival_fraction": 0.95},
+     "advance_mean_speed_mps": 1.00, "advance_survival_fraction": 0.95},
     {"target_speed_mps": 2.25, "wheel_friction": 0.0005,
-     "advance_mean_speed_mps": 1.40, "advance_survival_fraction": 0.93},
+     "advance_mean_speed_mps": 0.95, "advance_survival_fraction": 0.93},
     {"target_speed_mps": 2.25, "wheel_friction": 0.0010,
-     "advance_mean_speed_mps": 1.25, "advance_survival_fraction": 0.92},
+     "advance_mean_speed_mps": 0.90, "advance_survival_fraction": 0.92},
     {"target_speed_mps": 2.25, "wheel_friction": 0.0015,
-     "advance_mean_speed_mps": 1.10, "advance_survival_fraction": 0.90},
+     "advance_mean_speed_mps": 0.85, "advance_survival_fraction": 0.90},
     {"target_speed_mps": 2.25, "wheel_friction": 0.0020,
-     "advance_mean_speed_mps": 1.00, "advance_survival_fraction": 0.90},
+     "advance_mean_speed_mps": 0.80, "advance_survival_fraction": 0.90},
     {"target_speed_mps": 2.25, "wheel_friction": 0.0025,
-     "advance_mean_speed_mps": 0.90, "advance_survival_fraction": 0.90},
+     "advance_mean_speed_mps": 0.75, "advance_survival_fraction": 0.90},
     {"target_speed_mps": 2.25, "wheel_friction": 0.0030,
      "advance_mean_speed_mps": 0.80, "advance_survival_fraction": 0.90},
 )
