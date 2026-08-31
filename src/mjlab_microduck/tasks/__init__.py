@@ -55,6 +55,10 @@ from .microduck_velocity_race5_env_cfg import (
     make_microduck_velocity_race5_env_cfg,
     MicroduckRace5RlCfg,
 )
+from .microduck_velocity_race5_constrained_env_cfg import (
+    make_microduck_velocity_race5_constrained_env_cfg,
+    MicroduckRace5ConstrainedRlCfg,
+)
 from .microduck_speed_discovery_env_cfg import (
     make_microduck_speed_discovery_env_cfg,
     MicroduckSpeedDiscoveryRlCfg,
@@ -241,6 +245,15 @@ register_mjlab_task(
     env_cfg=make_microduck_velocity_race5_env_cfg(),
     play_env_cfg=make_microduck_velocity_race5_env_cfg(play=True),
     rl_cfg=MicroduckRace5RlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller RACE5 CONSTRAINED — V11 fine-tuning for speed that remains on line.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Race5Constrained-MicroDuck",
+    env_cfg=make_microduck_velocity_race5_constrained_env_cfg(),
+    play_env_cfg=make_microduck_velocity_race5_constrained_env_cfg(play=True),
+    rl_cfg=MicroduckRace5ConstrainedRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
