@@ -95,6 +95,10 @@ from .microduck_velocity_race5_frontier_env_cfg import (
     make_microduck_velocity_race5_frontier_env_cfg,
     MicroduckRace5FrontierRlCfg,
 )
+from .microduck_velocity_race5_fusion_env_cfg import (
+    MicroduckRace5FusionRlCfg,
+    make_microduck_velocity_race5_fusion_env_cfg,
+)
 from .microduck_speed_discovery_env_cfg import (
     make_microduck_speed_discovery_env_cfg,
     MicroduckSpeedDiscoveryRlCfg,
@@ -320,6 +324,16 @@ register_mjlab_task(
     env_cfg=make_microduck_velocity_race5_frontier_env_cfg(),
     play_env_cfg=make_microduck_velocity_race5_frontier_env_cfg(play=True),
     rl_cfg=MicroduckRace5FrontierRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller RACE5 FUSION — optimize a V57b-guided speed branch, then deploy it
+# inside the immutable qualified control-aware shell.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Race5Fusion-MicroDuck",
+    env_cfg=make_microduck_velocity_race5_fusion_env_cfg(),
+    play_env_cfg=make_microduck_velocity_race5_fusion_env_cfg(play=True),
+    rl_cfg=MicroduckRace5FusionRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

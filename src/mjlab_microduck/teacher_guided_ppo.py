@@ -15,12 +15,13 @@ from rsl_rl.algorithms import PPO
 
 
 class DuckLabOnnxSpeedTeacher(nn.Module):
-    """Torch replay of DuckLab's distilled donor-residual ONNX policy.
+    """Torch replay of a supported normalized MicroDuck ONNX actor.
 
     The 5090 review bundle intentionally contains no optimizer checkpoint.  Its
-    V47 policy is nevertheless a small, deterministic MLP graph, so loading the
+    policies are nevertheless small, deterministic MLP graphs, so loading the
     graph weights into frozen Torch buffers lets thousands of GPU environments
-    use it as a teacher without a CPU ONNX Runtime round trip.
+    use them as teachers without a CPU ONNX Runtime round trip. Both DuckLab's
+    V47 donor/residual export and the standard rsl_rl actor export are accepted.
     """
 
     def __init__(self, policy_path: str) -> None:
@@ -30,7 +31,7 @@ class DuckLabOnnxSpeedTeacher(nn.Module):
             item.name: torch.from_numpy(numpy_helper.to_array(item).copy())
             for item in model.graph.initializer
         }
-        required = {
+        residual_required = {
             "observation_mean",
             "observation_std",
             "actor.base_actor.donor.0.weight",
@@ -39,10 +40,28 @@ class DuckLabOnnxSpeedTeacher(nn.Module):
             "ducklab_action_multiplier",
             "ducklab_action_offset",
         }
-        missing = sorted(required - weights.keys())
-        if missing:
+        standard_required = {
+            "obs_normalizer._mean",
+            "onnx::Div_24",
+            "mlp.0.weight",
+            "mlp.0.bias",
+            "mlp.2.weight",
+            "mlp.2.bias",
+            "mlp.4.weight",
+            "mlp.4.bias",
+            "mlp.6.weight",
+            "mlp.6.bias",
+        }
+        if residual_required <= weights.keys():
+            self.actor_kind = "donor_residual"
+        elif standard_required <= weights.keys():
+            self.actor_kind = "standard_mlp"
+        else:
+            residual_missing = sorted(residual_required - weights.keys())
+            standard_missing = sorted(standard_required - weights.keys())
             raise ValueError(
-                f"Unsupported DuckLab speed-teacher graph; missing {missing}"
+                "Unsupported MicroDuck speed-teacher graph; "
+                f"residual missing {residual_missing}; standard missing {standard_missing}"
             )
         for name, value in weights.items():
             self.register_buffer(name.replace(".", "__"), value)
@@ -66,6 +85,12 @@ class DuckLabOnnxSpeedTeacher(nn.Module):
         actor_observations = (
             observations if isinstance(observations, torch.Tensor) else observations["actor"]
         )
+        if self.actor_kind == "standard_mlp":
+            normalized = (
+                actor_observations - self._weight("obs_normalizer._mean")
+            ) / self._weight("onnx::Div_24")
+            return self._mlp(normalized, "mlp", (0, 2, 4, 6))
+
         normalized = (
             actor_observations - self._weight("observation_mean")
         ) / self._weight("observation_std")
