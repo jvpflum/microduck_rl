@@ -15,6 +15,38 @@ class MicroduckOnPolicyRunner(VelocityOnPolicyRunner):
             alg["symmetry_cfg"] = {k: v for k, v in sym.items() if k != "_env"}
 
 
+class MicroduckFrontierAdapterRunner(MicroduckOnPolicyRunner):
+    """Train a phase adapter while keeping the proven skate actor immutable."""
+
+    def __init__(self, env, train_cfg: dict, log_dir=None, device="cpu", **kwargs):
+        super().__init__(env, train_cfg, log_dir, device, **kwargs)
+        actor = self.alg.actor
+        for parameter in actor.parameters():
+            parameter.requires_grad_(False)
+
+        phase_input_weights = actor.mlp[0].weight
+        if phase_input_weights.shape[1] != 61:
+            raise ValueError(
+                "Frontier adapter requires the unified 61D actor observation"
+            )
+        phase_input_weights.requires_grad_(True)
+        gradient_mask = phase_input_weights.new_zeros(phase_input_weights.shape)
+        gradient_mask[:, -6:] = 1.0
+        phase_input_weights.register_hook(lambda gradient: gradient * gradient_mask)
+        # RSL-RL updates normalizer buffers separately from optimizer
+        # parameters. Keep the champion's original observation calibration
+        # immutable; phase inputs use the unit moments installed by the
+        # frontier warm-start script.
+        actor.obs_normalizer.eval()
+        actor.update_normalization = lambda observations: None
+
+        self.frontier_trainable_actor_parameters = int(gradient_mask.sum().item())
+        print(
+            "[FrontierAdapter] froze champion actor; training "
+            f"{self.frontier_trainable_actor_parameters} phase-input weights"
+        )
+
+
 from .microduck_velocity_env_cfg import (
     make_microduck_velocity_env_cfg,
     MicroduckRlCfg,
@@ -98,6 +130,10 @@ from .microduck_speed_command_breakthrough_env_cfg import (
 from .microduck_speed_teacher_guided_env_cfg import (
     make_microduck_speed_teacher_guided_env_cfg,
     MicroduckSpeedTeacherGuidedRlCfg,
+)
+from .microduck_speed_frontier_env_cfg import (
+    make_microduck_speed_frontier_env_cfg,
+    MicroduckSpeedFrontierRlCfg,
 )
 from .microduck_velocity_swizzle_env_cfg import (
     make_microduck_velocity_swizzle_env_cfg,
@@ -353,6 +389,14 @@ register_mjlab_task(
     play_env_cfg=make_microduck_speed_teacher_guided_env_cfg(play=True),
     rl_cfg=MicroduckSpeedTeacherGuidedRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedFrontier-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_frontier_env_cfg(),
+    play_env_cfg=make_microduck_speed_frontier_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedFrontierRlCfg,
+    runner_cls=MicroduckFrontierAdapterRunner,
 )
 
 # Roller SWIZZLE task — clean classic swizzle (symmetric, feet grounded).

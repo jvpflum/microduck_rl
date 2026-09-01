@@ -28,6 +28,14 @@ from mjlab.actuator.actuator import ActuatorCmd
 class FrictionDRBamActuator(BamActuator):
     """BamActuator + per-env friction_scale on the BAM friction budget."""
 
+    def __init__(self, cfg, entity, target_ids, target_names) -> None:
+        super().__init__(cfg, entity, target_ids, target_names)
+        # BAM supports the XL330 firmware current limiter, but BamActuatorCfg
+        # does not currently expose it.  Keep the default behaviour unchanged
+        # and allow frontier tasks to opt into the real 1.75 A limit explicitly.
+        if cfg.max_current is not None:
+            self._bam_model.actuator.max_current = float(cfg.max_current)
+
     def initialize(self, mj_model, model, data, device) -> None:
         super().initialize(mj_model, model, data, device)
         # kp_scale is (num_envs, 1); mirror it for a per-env friction multiplier.
@@ -56,6 +64,8 @@ class FrictionDRBamActuator(BamActuator):
 @dataclass(kw_only=True)
 class FrictionDRBamActuatorCfg(BamActuatorCfg):
     """Drop-in for BamActuatorCfg that builds a friction-DR-capable actuator."""
+
+    max_current: float | None = None
 
     def build(self, entity, target_ids, target_names) -> FrictionDRBamActuator:
         return FrictionDRBamActuator(self, entity, target_ids, target_names)
