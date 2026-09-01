@@ -21,6 +21,7 @@ agents
 *.pch
 nohup.out
 *.onnx
+!protected_checkpoints/microduck_hybrid/*.onnx
 beyondmimic_motions/
 artifacts/
 *.npz
