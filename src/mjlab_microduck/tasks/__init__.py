@@ -83,6 +83,10 @@ from .microduck_speed_scout_transfer_env_cfg import (
     make_microduck_speed_scout_transfer_env_cfg,
     MicroduckSpeedScoutTransferRlCfg,
 )
+from .microduck_speed_friction_tether_env_cfg import (
+    make_microduck_speed_friction_tether_env_cfg,
+    MicroduckSpeedFrictionTetherRlCfg,
+)
 from .microduck_speed_official_adaptation_env_cfg import (
     make_microduck_speed_official_adaptation_env_cfg,
     MicroduckSpeedOfficialAdaptationRlCfg,
@@ -90,6 +94,10 @@ from .microduck_speed_official_adaptation_env_cfg import (
 from .microduck_speed_command_breakthrough_env_cfg import (
     make_microduck_speed_command_breakthrough_env_cfg,
     MicroduckSpeedCommandBreakthroughRlCfg,
+)
+from .microduck_speed_teacher_guided_env_cfg import (
+    make_microduck_speed_teacher_guided_env_cfg,
+    MicroduckSpeedTeacherGuidedRlCfg,
 )
 from .microduck_velocity_swizzle_env_cfg import (
     make_microduck_velocity_swizzle_env_cfg,
@@ -316,6 +324,14 @@ register_mjlab_task(
 )
 
 register_mjlab_task(
+    task_id="Mjlab-SpeedFrictionTether-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_friction_tether_env_cfg(),
+    play_env_cfg=make_microduck_speed_friction_tether_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedFrictionTetherRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
     task_id="Mjlab-SpeedOfficialAdaptation-Flat-MicroDuck-Rollers",
     env_cfg=make_microduck_speed_official_adaptation_env_cfg(),
     play_env_cfg=make_microduck_speed_official_adaptation_env_cfg(play=True),
@@ -328,6 +344,14 @@ register_mjlab_task(
     env_cfg=make_microduck_speed_command_breakthrough_env_cfg(),
     play_env_cfg=make_microduck_speed_command_breakthrough_env_cfg(play=True),
     rl_cfg=MicroduckSpeedCommandBreakthroughRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedTeacherGuided-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_teacher_guided_env_cfg(),
+    play_env_cfg=make_microduck_speed_teacher_guided_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedTeacherGuidedRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
