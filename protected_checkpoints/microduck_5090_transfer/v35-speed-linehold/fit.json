@@ -1,0 +1,107 @@
+{
+  "created_at": "2026-09-01T15:18:36+00:00",
+  "datasets": [
+    {
+      "path": "/home/jarro/ducklab-private/candidates/frontier-v35-native-dagger-g51s2/native_teacher_exact_full.npz",
+      "samples": 2676,
+      "sha256": "c38d7e7e1ee209c3aa222b2ae45ff1ab59d84c48bf1d56fa408895b8e4c1818d"
+    },
+    {
+      "path": "/home/jarro/ducklab-private/candidates/frontier-v35-native-dagger-g51s2/dagger1_mix050.npz",
+      "samples": 1000,
+      "sha256": "e34babbc70f19be52133e90f46e0ebcccbfc04c3d4200e59c8bcbaaca0cc35fa"
+    },
+    {
+      "path": "/home/jarro/ducklab-private/candidates/frontier-v35-native-dagger-g51s2/dagger2_mix000.npz",
+      "samples": 1000,
+      "sha256": "3f1bc46771d98e947115e9f38f8f0d0280ef259e6d00c81c9fcd932b72ecdb34"
+    },
+    {
+      "path": "/home/jarro/ducklab-private/candidates/frontier-v35-native-dagger-g51s2/gated_dagger1_mix000.npz",
+      "samples": 1000,
+      "sha256": "4fe9ae83406b9b6db9af349d614ae4faa8620dbdb23cbebcef42d48d51314596"
+    }
+  ],
+  "final_training": {
+    "mae": 0.011376149021089077,
+    "max_abs": 0.18811950087547302,
+    "rmse": 0.02114728093147278
+  },
+  "final_validation": {
+    "mae": 0.011808968149125576,
+    "max_abs": 0.15214073657989502,
+    "rmse": 0.021790476515889168
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "training_loss": 0.0074546712450683115,
+      "validation_rmse": 0.022150900214910507
+    },
+    {
+      "epoch": 25,
+      "training_loss": 0.007317994721233845,
+      "validation_rmse": 0.021961446851491928
+    },
+    {
+      "epoch": 50,
+      "training_loss": 0.0072880819439888,
+      "validation_rmse": 0.02196839265525341
+    },
+    {
+      "epoch": 75,
+      "training_loss": 0.007253078278154135,
+      "validation_rmse": 0.021941091865301132
+    },
+    {
+      "epoch": 100,
+      "training_loss": 0.007207348570227623,
+      "validation_rmse": 0.021974580362439156
+    },
+    {
+      "epoch": 125,
+      "training_loss": 0.0071737774647772316,
+      "validation_rmse": 0.021916981786489487
+    },
+    {
+      "epoch": 150,
+      "training_loss": 0.007132363226264715,
+      "validation_rmse": 0.021937396377325058
+    },
+    {
+      "epoch": 175,
+      "training_loss": 0.007094560377299786,
+      "validation_rmse": 0.02190777100622654
+    },
+    {
+      "epoch": 200,
+      "training_loss": 0.0070646173320710656,
+      "validation_rmse": 0.021847452968358994
+    },
+    {
+      "epoch": 225,
+      "training_loss": 0.007025970704853534,
+      "validation_rmse": 0.021957246586680412
+    },
+    {
+      "epoch": 250,
+      "training_loss": 0.006988816149532795,
+      "validation_rmse": 0.021904177963733673
+    }
+  ],
+  "initial_validation": {
+    "mae": 0.012125696055591106,
+    "max_abs": 0.15025106072425842,
+    "rmse": 0.022073887288570404
+  },
+  "method": "native_mujoco_dagger",
+  "onnx_parity_max_abs_error": 1.239776611328125e-05,
+  "output_checkpoint": "/home/jarro/ducklab-private/candidates/frontier-v35-native-dagger-g51s2/model_gated_r1.pt",
+  "output_checkpoint_sha256": "9c872bbcf8d11765b15f7d48a0d92ddce8ab2f99528818ea2c976ac3a0353b06",
+  "output_onnx": "/home/jarro/ducklab-private/candidates/frontier-v35-native-dagger-g51s2/model_gated_r1.onnx",
+  "output_onnx_sha256": "8108992d8d8b2096bbf503404e3cf40c06aa41664c8a34db1cc3265eb8262b5e",
+  "samples": 5676,
+  "source_checkpoint": "/home/jarro/ducklab-private/candidates/frontier-v35-native-dagger-g51s2/model_gated_r0.pt",
+  "source_checkpoint_sha256": "ff2d0c8c3ff4804a3b3e108840e909d2154554b7c1e45122d6f68cbf8611b647",
+  "trainable_scope": "gated_residual_only"
+}

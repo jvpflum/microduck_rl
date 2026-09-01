@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-01",
+  "source_worker": "chromedome-rtx5090",
+  "artifact_policy": "onnx-and-scrubbed-evaluation-only",
+  "candidates": {
+    "v35-speed-linehold": {
+      "policy_sha256": "8108992d8d8b2096bbf503404e3cf40c06aa41664c8a34db1cc3265eb8262b5e",
+      "status": "preserved-control"
+    },
+    "v47-speed-specialist": {
+      "policy_sha256": "6079db680499a771ef34a9d391b97eee4276332df54bd3a461a7362e021add87",
+      "status": "best-high-speed-specialist"
+    },
+    "v53-multiskill-experimental": {
+      "policy_sha256": "380c2a4d2353dc26a9efa51f384257056c3decbd169351c997bf1e8ecfa436ae",
+      "status": "experimental-not-promoted",
+      "known_failure": "full-speed braking lateral slide"
+    }
+  },
+  "evaluation_constraints": {
+    "wheel_frictionloss": 0.003,
+    "current_limit_a": 1.75
+  }
+}
