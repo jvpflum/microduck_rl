@@ -1,4 +1,4 @@
-65797a35b457fcf26023cd737c5e71f6d6a3313e4b68eeeb4a3d37be5e533513  ./README.md
+6c9a33aedbf2bddfdbb5ff370daedb505a24133f8d810cd50e41399bb7406c5c  ./README.md
 1e8d826ccf855f7690e9b8410e194bae039861d2e30dd01a9dfe7c55f809a4ff  ./manifest.json
 17ddf7337f96124c4bd9478ec9b13f87302b02d13d0d194e406a9fbf8d8f2660  ./transition-sweeps/v52-two-policy/decel_0.20.json
 9302c7665cd44f6f2e7a5aa8fce52d95e969edc36d70b0a4aaaf0a0c1d485bcf  ./transition-sweeps/v52-two-policy/decel_0.25.json
@@ -27,6 +27,7 @@ f097ada55b5e40178c34b3d9cfcef6f8b451058fc55b46174aa675d723116acf  ./transition-s
 c0ab38bac09c590f9a7cf5d067294f6d8f5a4e8847be90e264857f86d389f36b  ./v35-speed-linehold/race5_full.json
 a5b26e8311785b450bf7f232cd9b417d175f81833e1adb0fdb373903ebedf25b  ./v35-speed-linehold/race_screen.json
 6079db680499a771ef34a9d391b97eee4276332df54bd3a461a7362e021add87  ./v47-speed-specialist/policy.onnx
+8666f4b5a1eb431c8d3d2c13e024fd6f26d7b09e6215794aa17793d6306317b8  ./v47-speed-specialist/race5_launch_assisted_spark.json
 eb0c74745dd757efadf4addba08ee07e17d3a419ddbc643acaee5732a34a4a45  ./v47-speed-specialist/race5_full_baked.json
 210547ba7ee71cfcf40b0bbd24cf85747245ffd779ba6d13a1129db7bb23e87b  ./v47-speed-specialist/race_screen_baked.json
 157b0d02a2c1fc79a3103c9116774fb1e5768a78cd82ad4cdf64b8bde36ba5af  ./v47-speed-specialist/race_screen_external_affine.json

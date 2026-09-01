@@ -24,6 +24,16 @@ controller: zero-command, braking, and turning require the multi-skill router.
 - Official wheel friction: `0.003`
 - Official evaluator current limit: `1.75 A`
 
+Spark operator testing found a deterministic launch correction: two `-0.30`
+yaw-command pulses, each 40 ms long, starting 0.30 s after the forward command
+with a 100 ms gap. With the standard line controller and browser-faithful
+`±0.30` yaw clamp, this reduced the 100-foot result from 26.980 s to 25.947 s,
+raised verified top speed from 2.985 to 3.061 mph, improved first-second
+acceleration from 0.402 to 0.465 m/s², and reduced drift from 0.605 to 0.575 ft.
+See `v47-speed-specialist/race5_launch_assisted_spark.json`. This is an explicit
+outer-loop launch assist, not a new policy checkpoint; V47 still moves at zero
+command and remains a speed specialist.
+
 ## `v53-multiskill-experimental`
 
 Command-gated composite of the V47 speed specialist, the V35 low-speed straight
