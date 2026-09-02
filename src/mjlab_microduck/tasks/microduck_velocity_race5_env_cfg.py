@@ -65,6 +65,41 @@ def race_launch_speed_progress(
     return torch.nan_to_num((speed / reference_speed) * launch_weight, nan=0.0)
 
 
+def race_launch_lateral_speed_squared(
+    env: "ManagerBasedRlEnv",
+    reference_speed: float = 0.18,
+    window_s: float = 1.25,
+) -> torch.Tensor:
+    """Charge cross-track motion heavily during the first skating stroke.
+
+    The ordinary race-line terms eventually correct a sideways gait, but a
+    high-speed teacher can still spend its first second crab-walking before
+    those costs dominate.  This is deliberately world-frame (course-relative)
+    and fades after the launch window, so it does not suppress legitimate
+    steering in the deployment control shell.
+    """
+    lateral_speed = env.scene["robot"].data.root_link_lin_vel_w[:, 1]
+    age_s = env.episode_length_buf.to(dtype=torch.float32) * float(env.step_dt)
+    early = torch.clamp(1.0 - age_s / max(float(window_s), 0.05), min=0.0)
+    cost = (lateral_speed / max(float(reference_speed), 0.01)).square() * early
+    return torch.nan_to_num(cost, nan=0.0, posinf=100.0)
+
+
+def race_launch_heading_error_squared(
+    env: "ManagerBasedRlEnv",
+    reference_yaw_rad: float = 0.10,
+    window_s: float = 1.25,
+) -> torch.Tensor:
+    """Keep the chassis pointed down-course until the first stride is clean."""
+    quat = env.scene["robot"].data.root_link_quat_w
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    age_s = env.episode_length_buf.to(dtype=torch.float32) * float(env.step_dt)
+    early = torch.clamp(1.0 - age_s / max(float(window_s), 0.05), min=0.0)
+    cost = (yaw / max(float(reference_yaw_rad), 0.01)).square() * early
+    return torch.nan_to_num(cost, nan=0.0, posinf=100.0)
+
+
 def make_microduck_velocity_race5_env_cfg(
     play: bool = False,
 ) -> ManagerBasedRlEnvCfg:

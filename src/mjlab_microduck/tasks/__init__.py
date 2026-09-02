@@ -47,6 +47,33 @@ class MicroduckFrontierAdapterRunner(MicroduckOnPolicyRunner):
         )
 
 
+class MicroduckConservativeHeadRunner(MicroduckOnPolicyRunner):
+    """Adapt only the action head while preserving a deployed speed gait."""
+
+    def __init__(self, env, train_cfg: dict, log_dir=None, device="cpu", **kwargs):
+        super().__init__(env, train_cfg, log_dir, device, **kwargs)
+        actor = self.alg.actor
+        for parameter in actor.parameters():
+            parameter.requires_grad_(False)
+
+        action_head = actor.mlp[-1]
+        action_head.weight.requires_grad_(True)
+        action_head.bias.requires_grad_(True)
+        # The exact deployment normalizer is part of the policy. Updating it
+        # during a short refinement changes every hidden activation at once.
+        actor.obs_normalizer.eval()
+        actor.update_normalization = lambda observations: None
+
+        trainable = sum(
+            parameter.numel() for parameter in actor.parameters()
+            if parameter.requires_grad
+        )
+        print(
+            "[ConservativeHead] froze actor normalizer/body; training "
+            f"{trainable} action-head parameters"
+        )
+
+
 from .microduck_velocity_env_cfg import (
     make_microduck_velocity_env_cfg,
     MicroduckRlCfg,
@@ -99,6 +126,14 @@ from .microduck_velocity_race5_fusion_env_cfg import (
     MicroduckRace5FusionRlCfg,
     make_microduck_velocity_race5_fusion_env_cfg,
 )
+from .microduck_velocity_race5_v59_refinement_env_cfg import (
+    MicroduckRace5V59RefinementRlCfg,
+    make_microduck_velocity_race5_v59_refinement_env_cfg,
+)
+from .microduck_velocity_race5_clean_launch_env_cfg import (
+    MicroduckRace5CleanLaunchRlCfg,
+    make_microduck_velocity_race5_clean_launch_env_cfg,
+)
 from .microduck_speed_discovery_env_cfg import (
     make_microduck_speed_discovery_env_cfg,
     MicroduckSpeedDiscoveryRlCfg,
@@ -142,6 +177,14 @@ from .microduck_speed_teacher_guided_env_cfg import (
 from .microduck_speed_frontier_env_cfg import (
     make_microduck_speed_frontier_env_cfg,
     MicroduckSpeedFrontierRlCfg,
+)
+from .microduck_speed_final_env_cfg import (
+    make_microduck_speed_final_env_cfg,
+    MicroduckSpeedFinalRlCfg,
+)
+from .microduck_speed_v65_final_env_cfg import (
+    make_microduck_speed_v65_final_env_cfg,
+    MicroduckSpeedV65FinalRlCfg,
 )
 from .microduck_velocity_swizzle_env_cfg import (
     make_microduck_velocity_swizzle_env_cfg,
@@ -337,6 +380,26 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
+# Roller RACE5 V59 REFINEMENT — make conservative improvements to the exact
+# V59 high-speed branch used by V66; deployment retains V66's control router.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Race5V59Refinement-MicroDuck",
+    env_cfg=make_microduck_velocity_race5_v59_refinement_env_cfg(),
+    play_env_cfg=make_microduck_velocity_race5_v59_refinement_env_cfg(play=True),
+    rl_cfg=MicroduckRace5V59RefinementRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller RACE5 CLEAN LAUNCH — remove the V59 speed branch's initial crab gait;
+# V66 remains responsible for all non-straight deployment commands.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Race5CleanLaunch-MicroDuck",
+    env_cfg=make_microduck_velocity_race5_clean_launch_env_cfg(),
+    play_env_cfg=make_microduck_velocity_race5_clean_launch_env_cfg(play=True),
+    rl_cfg=MicroduckRace5CleanLaunchRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
 # Roller SPEED DISCOVERY — nominal physics and unconstrained chassis velocity.
 register_mjlab_task(
     task_id="Mjlab-SpeedDiscovery-Flat-MicroDuck-Rollers",
@@ -425,6 +488,25 @@ register_mjlab_task(
     play_env_cfg=make_microduck_speed_frontier_env_cfg(play=True),
     rl_cfg=MicroduckSpeedFrontierRlCfg,
     runner_cls=MicroduckFrontierAdapterRunner,
+)
+
+# Roller SPEED FINAL — exact V59 initialization plus a bounded official-friction
+# search for the replaceable V66 high-command branch.
+register_mjlab_task(
+    task_id="Mjlab-SpeedFinal-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_final_env_cfg(),
+    play_env_cfg=make_microduck_speed_final_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedFinalRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller V65 FINAL — exact V66 high branch, fixed-rate action-head-only search.
+register_mjlab_task(
+    task_id="Mjlab-SpeedV65Final-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_v65_final_env_cfg(),
+    play_env_cfg=make_microduck_speed_v65_final_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedV65FinalRlCfg,
+    runner_cls=MicroduckConservativeHeadRunner,
 )
 
 # Roller SWIZZLE task — clean classic swizzle (symmetric, feet grounded).
