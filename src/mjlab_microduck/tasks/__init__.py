@@ -144,6 +144,10 @@ from .microduck_velocity_race5_frontier_env_cfg import (
     make_microduck_velocity_race5_frontier_env_cfg,
     MicroduckRace5FrontierRlCfg,
 )
+from .microduck_velocity_race5_v71_all_around_env_cfg import (
+    make_microduck_velocity_race5_v71_all_around_env_cfg,
+    MicroduckRace5V71AllAroundRlCfg,
+)
 from .microduck_velocity_race5_fusion_env_cfg import (
     MicroduckRace5FusionRlCfg,
     make_microduck_velocity_race5_fusion_env_cfg,
@@ -397,6 +401,16 @@ register_mjlab_task(
     env_cfg=make_microduck_velocity_race5_frontier_env_cfg(),
     play_env_cfg=make_microduck_velocity_race5_frontier_env_cfg(play=True),
     rl_cfg=MicroduckRace5FrontierRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller RACE5 V71 — all-around refinement from V65 with a V67 high-command
+# donor and the control-aware probe route retained across the full command set.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Race5V71AllAround-MicroDuck",
+    env_cfg=make_microduck_velocity_race5_v71_all_around_env_cfg(),
+    play_env_cfg=make_microduck_velocity_race5_v71_all_around_env_cfg(play=True),
+    rl_cfg=MicroduckRace5V71AllAroundRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
