@@ -74,6 +74,28 @@ class MicroduckConservativeHeadRunner(MicroduckOnPolicyRunner):
         )
 
 
+class MicroduckResidualGuidedRunner(MicroduckOnPolicyRunner):
+    """Train a full actor while keeping the deployed observation calibration."""
+
+    def __init__(self, env, train_cfg: dict, log_dir=None, device="cpu", **kwargs):
+        super().__init__(env, train_cfg, log_dir, device, **kwargs)
+        actor = self.alg.actor
+        # Reset bootstraps deliberately change the state distribution.  The
+        # normalizer is part of the deployed policy, so updating it would make
+        # a small PPO change look like a wholesale policy rewrite at export.
+        actor.obs_normalizer.eval()
+        actor.update_normalization = lambda observations: None
+        trainable = sum(
+            parameter.numel()
+            for parameter in actor.parameters()
+            if parameter.requires_grad
+        )
+        print(
+            "[ResidualGuided] frozen observation normalizer; training "
+            f"{trainable} actor/critic parameters with teacher anchors"
+        )
+
+
 from .microduck_velocity_env_cfg import (
     make_microduck_velocity_env_cfg,
     MicroduckRlCfg,
@@ -177,6 +199,14 @@ from .microduck_speed_teacher_guided_env_cfg import (
 from .microduck_speed_frontier_env_cfg import (
     make_microduck_speed_frontier_env_cfg,
     MicroduckSpeedFrontierRlCfg,
+)
+from .microduck_speed_v70_residual_env_cfg import (
+    make_microduck_speed_v70_residual_env_cfg,
+    MicroduckSpeedV70ResidualRlCfg,
+)
+from .microduck_speed_v70_residual_env_cfg import (
+    make_microduck_speed_v70_residual_env_cfg,
+    MicroduckSpeedV70ResidualRlCfg,
 )
 from .microduck_speed_final_env_cfg import (
     make_microduck_speed_final_env_cfg,
@@ -507,6 +537,15 @@ register_mjlab_task(
     play_env_cfg=make_microduck_speed_v65_final_env_cfg(play=True),
     rl_cfg=MicroduckSpeedV65FinalRlCfg,
     runner_cls=MicroduckConservativeHeadRunner,
+)
+
+# Roller V70 RESIDUAL — deployable teacher-guided contact/stride refinement.
+register_mjlab_task(
+    task_id="Mjlab-SpeedV70Residual-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_v70_residual_env_cfg(),
+    play_env_cfg=make_microduck_speed_v70_residual_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedV70ResidualRlCfg,
+    runner_cls=MicroduckResidualGuidedRunner,
 )
 
 # Roller SWIZZLE task — clean classic swizzle (symmetric, feet grounded).
