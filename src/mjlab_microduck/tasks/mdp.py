@@ -1,7 +1,9 @@
 """MDP functions for microduck tasks"""
 
 import math
+import json
 from dataclasses import dataclass as _dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -112,6 +114,132 @@ except Exception:
 
 print("[mdp] Patch 4 active: ONNX export filters passive_* joints")
 
+# ---------------------------------------------------------------------------
+# Patch 5: optional physical roll-in action controller for front-flip tasks.
+# A checkpoint trained from teleported flight states does not see the actuator
+# and contact history present after a real V69 launch.  When a joint action cfg
+# carries ``frontflip_rollin``, execute the protected V69 primitive through the
+# real actuator stack, then smoothly give control to the policy.  The action
+# manager history is overwritten with the action that was actually applied so
+# the actor sees deploy-equivalent previous-action observations.
+# ---------------------------------------------------------------------------
+_orig_joint_process_actions = _JointAction.process_actions
+_orig_joint_reset = _JointAction.reset
+
+
+def _rollin_ids(term, env_ids):
+    if env_ids is None or isinstance(env_ids, slice):
+        return torch.arange(term.num_envs, device=term.device)[env_ids]
+    return env_ids.to(term.device, dtype=torch.long)
+
+
+def _rollin_load_primitive(term, spec):
+    if hasattr(term, "_frontflip_rollin_times"):
+        return
+    document = json.loads(Path(spec["primitive_path"]).read_text())
+    if not math.isclose(float(document["wheel_frictionloss"]), 0.003, abs_tol=1e-12):
+        raise ValueError("front-flip roll-in primitive must use frictionloss 0.003")
+    if not math.isclose(float(document["current_limit_a"]), 1.75, abs_tol=1e-12):
+        raise ValueError("front-flip roll-in primitive must use the 1.75 A limit")
+    term._frontflip_rollin_times = torch.as_tensor(
+        document["knot_times_s"], dtype=torch.float32, device=term.device
+    )
+    term._frontflip_rollin_nodes = torch.as_tensor(
+        document["full_nodes"], dtype=torch.float32, device=term.device
+    )
+    term._frontflip_rollin_handoff = torch.full(
+        (term.num_envs,), float(spec.get("handoff_time_min", 0.72)),
+        dtype=torch.float32, device=term.device,
+    )
+    term._env._frontflip_rollin_handoff = term._frontflip_rollin_handoff
+
+
+def _rollin_joint_reset(self, env_ids=None):
+    _orig_joint_reset(self, env_ids)
+    spec = (
+        getattr(self.cfg, "frontflip_rollin", None)
+        or getattr(self.cfg, "frontflip_residual_prior", None)
+    )
+    if not spec:
+        return
+    _rollin_load_primitive(self, spec)
+    ids = _rollin_ids(self, env_ids)
+    if len(ids) == 0:
+        return
+    low = float(spec.get("handoff_time_min", 0.72))
+    high = float(spec.get("handoff_time_max", low))
+    self._frontflip_rollin_handoff[ids] = low + torch.rand(
+        len(ids), device=self.device
+    ) * (high - low)
+
+
+def _rollin_joint_process_actions(self, actions: torch.Tensor):
+    _orig_joint_process_actions(self, actions)
+    rollin_spec = getattr(self.cfg, "frontflip_rollin", None)
+    residual_spec = getattr(self.cfg, "frontflip_residual_prior", None)
+    if rollin_spec and residual_spec:
+        raise ValueError("frontflip_rollin and frontflip_residual_prior are mutually exclusive")
+    spec = rollin_spec or residual_spec
+    if not spec:
+        return
+    _rollin_load_primitive(self, spec)
+    time_s = self._env.episode_length_buf.to(torch.float32) * self._env.step_dt
+    times = self._frontflip_rollin_times
+    nodes = self._frontflip_rollin_nodes
+    index = torch.bucketize(time_s, times[1:], right=False)
+    index = torch.clamp(index, 0, len(times) - 2)
+    t0 = times[index]
+    t1 = times[index + 1]
+    fraction = torch.clamp((time_s - t0) / torch.clamp(t1 - t0, min=1e-6), 0.0, 1.0)
+    primitive_absolute = nodes[index] + fraction.unsqueeze(-1) * (
+        nodes[index + 1] - nodes[index]
+    )
+    offset = self._offset
+    scale = self._scale
+    primitive_raw = (primitive_absolute - offset) / scale
+    if residual_spec:
+        # The native trajectory is the nominal controller, not a reward hint.
+        # PPO therefore explores a bounded correction around a motion that is
+        # already known to produce substantial clean rotation.  This prevents
+        # early optimizer updates from destroying the discovered launch.
+        residual_scale = float(spec.get("residual_scale", 0.10))
+        if not 0.0 < residual_scale <= 0.5:
+            raise ValueError("front-flip residual scale must be in (0, 0.5]")
+        actual_raw = primitive_raw + residual_scale * actions
+        alpha = torch.ones_like(time_s)
+        self._env._frontflip_residual_policy_action = actions
+    else:
+        blend_time = max(float(spec.get("blend_time", 0.12)), 1e-6)
+        alpha = torch.clamp(
+            (time_s - self._frontflip_rollin_handoff) / blend_time, 0.0, 1.0
+        )
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+        actual_raw = primitive_raw * (1.0 - alpha.unsqueeze(-1)) + actions * alpha.unsqueeze(-1)
+    self._raw_actions[:] = actual_raw
+    self._processed_actions = actual_raw * scale + offset
+    if self.cfg.clip is not None:
+        self._processed_actions = torch.clamp(
+            self._processed_actions,
+            min=self._clip[:, :, 0],
+            max=self._clip[:, :, 1],
+        )
+    self._env.action_manager._action[:] = actual_raw
+    self._env._frontflip_rollin_policy_alpha = alpha
+
+
+_JointAction.reset = _rollin_joint_reset
+_JointAction.process_actions = _rollin_joint_process_actions
+
+print("[mdp] Patch 5 active: optional physical V69 front-flip roll-in")
+
+
+def roller_frontflip_residual_action_l2(env: "ManagerBasedRlEnv") -> torch.Tensor:
+    """Squared magnitude of the learned correction around the native motion."""
+    residual = getattr(env, "_frontflip_residual_policy_action", None)
+    if residual is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    return torch.sum(torch.square(residual), dim=-1)
+
 if TYPE_CHECKING:
     from mjlab.viewer.debug_visualizer import DebugVisualizer
 
@@ -216,7 +344,7 @@ def reset_with_forward_velocity(
     # Wheel radius = 0.0175 m (measured).
     # All 4 wheels spin at +ω for forward motion (verified by test_wheel_direction.py).
     _WHEEL_RADIUS = 0.0175
-    all_wheel_ids, _ = asset.find_joints(r"^passive_.*")
+    all_wheel_ids, _ = asset.find_joints(r"^passive_.*wheel$")
 
     if all_wheel_ids:
         joint_pos = asset.data.joint_pos[warmstart_ids].clone()
@@ -3461,6 +3589,24 @@ def reward_weight(
     return torch.tensor([term_cfg.weight])
 
 
+def reward_param_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_name: str,
+    param_stages: list[dict],
+) -> torch.Tensor:
+    """Step-staged mutation of a live reward term's parameters."""
+    del env_ids
+    term_cfg = env.reward_manager.get_term_cfg(reward_name)
+    current = param_stages[0]["params"]
+    for stage in param_stages:
+        if env.common_step_counter >= stage["step"]:
+            current = stage["params"]
+    term_cfg.params.update(current)
+    first_val = next(iter(current.values()))
+    return torch.tensor(float(first_val) if isinstance(first_val, (int, float)) else 0.0)
+
+
 def com_range_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -3545,6 +3691,7 @@ def velocity_command_ranges_curriculum(
     update_lin_vel_y: bool = True,
     update_ang_vel_z: bool = True,
     forward_only: bool = False,
+    min_forward_velocity: float = 0.0,
 ) -> torch.Tensor:
     """Update velocity command ranges based on training progress.
 
@@ -3587,7 +3734,7 @@ def velocity_command_ranges_curriculum(
 
     # Update command ranges
     if forward_only:
-        cfg.ranges.lin_vel_x = (0.0, current_lin_vel)
+        cfg.ranges.lin_vel_x = (min_forward_velocity, current_lin_vel)
     else:
         cfg.ranges.lin_vel_x = (-current_lin_vel, current_lin_vel)
     if update_lin_vel_y:
@@ -4474,6 +4621,195 @@ def event_param_curriculum(
     return torch.tensor(float(first_val) if isinstance(first_val, (int, float)) else 0.0)
 
 
+def backflip_performance_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    event_name: str,
+    stages: list[dict],
+    min_attempts: int = 2048,
+    min_stand_attempts: int = 128,
+    min_episode_steps: int = 1,
+    action_rate_reward_name: str = "action_rate_l2",
+    body_contact_reward_name: str = "body_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> dict[str, torch.Tensor]:
+    """Advance flip assistance only after controlled landing success.
+
+    CurriculumManager calls this before resetting completed environments, so
+    the terminal state is still available.  A success requires the flip
+    landing latch, no invalid body strike, upright posture, and low final
+    velocity.  Episodes with at least one simulated step count as attempts so
+    an early body-strike termination cannot disappear from the denominator.
+    This avoids the previous clock schedule removing assistance whether or not
+    the policy had learned the preceding stage.
+    """
+    if not hasattr(env, "_backflip_curriculum_stage"):
+        env._backflip_curriculum_stage = 0
+        env._backflip_curriculum_attempts = 0
+        env._backflip_curriculum_successes = 0
+        env._backflip_curriculum_last_rate = 0.0
+        env._backflip_curriculum_stand_attempts = 0
+        env._backflip_curriculum_stand_successes = 0
+        env._backflip_curriculum_stand_landings = 0
+        env._backflip_curriculum_stand_invalid = 0
+        env._backflip_curriculum_stand_rotation_sum = 0.0
+        env._backflip_curriculum_stand_clearance_sum = 0.0
+        env._backflip_curriculum_stand_foot_drop_sum = 0.0
+        env._backflip_curriculum_stand_readiness_sum = 0.0
+        env._backflip_curriculum_last_stand_rate = 0.0
+        env._backflip_curriculum_last_stand_landing_rate = 0.0
+        env._backflip_curriculum_last_stand_invalid_rate = 0.0
+        env._backflip_curriculum_last_stand_rotation_deg = 0.0
+        env._backflip_curriculum_last_stand_clearance = 0.0
+        env._backflip_curriculum_last_stand_foot_drop = 0.0
+        env._backflip_curriculum_last_stand_readiness = 0.0
+        env._backflip_curriculum_qualified_windows = 0
+
+    if env_ids is None or isinstance(env_ids, slice):
+        ids = torch.arange(env.num_envs, device=env.device)
+    else:
+        ids = env_ids.to(env.device, dtype=torch.long)
+    if len(ids) > 0:
+        valid = env.episode_length_buf[ids] >= min_episode_steps
+        completed = ids[valid]
+        if len(completed) > 0 and hasattr(env, "_roller_backflip_landed"):
+            asset: Entity = env.scene[asset_cfg.name]
+            quat = torch.nan_to_num(asset.data.root_link_quat_w[completed], nan=0.0)
+            up_z = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+            lin = torch.nan_to_num(asset.data.root_link_lin_vel_w[completed], nan=99.0).norm(dim=-1)
+            ang = torch.nan_to_num(asset.data.root_link_ang_vel_b[completed], nan=99.0).norm(dim=-1)
+            success = (
+                env._roller_backflip_landed[completed]
+                & ~env._roller_backflip_invalid[completed]
+                & (up_z >= math.cos(math.radians(15.0)))
+                & (lin <= 0.20)
+                & (ang <= 2.0)
+            )
+            env._backflip_curriculum_attempts += len(completed)
+            env._backflip_curriculum_successes += int(success.sum().item())
+            if hasattr(env, "_roller_backflip_demo_reset"):
+                stand_mask = ~env._roller_backflip_demo_reset[completed]
+                env._backflip_curriculum_stand_attempts += int(stand_mask.sum().item())
+                env._backflip_curriculum_stand_successes += int(
+                    (success & stand_mask).sum().item()
+                )
+                env._backflip_curriculum_stand_landings += int(
+                    (env._roller_backflip_landed[completed] & stand_mask).sum().item()
+                )
+                env._backflip_curriculum_stand_invalid += int(
+                    (env._roller_backflip_invalid[completed] & stand_mask).sum().item()
+                )
+                env._backflip_curriculum_stand_rotation_sum += float(
+                    env._roller_backflip_max[completed][stand_mask].sum().item()
+                )
+                env._backflip_curriculum_stand_clearance_sum += float(
+                    env._roller_backflip_peak_clearance[completed][stand_mask].sum().item()
+                )
+                stand_ids = completed[stand_mask]
+                if len(stand_ids) > 0:
+                    foot_ids = [
+                        asset.site_names.index("left_foot"),
+                        asset.site_names.index("right_foot"),
+                    ]
+                    root_z = asset.data.root_link_pos_w[stand_ids, 2]
+                    foot_z = asset.data.site_pos_w[stand_ids][:, foot_ids, 2]
+                    minimum_drop = root_z - torch.max(foot_z, dim=-1).values
+                    env._backflip_curriculum_stand_foot_drop_sum += float(
+                        minimum_drop.sum().item()
+                    )
+                    env._backflip_curriculum_stand_readiness_sum += float(
+                        env._roller_backflip_readiness_max[stand_ids].sum().item()
+                    )
+
+    stage_index = int(env._backflip_curriculum_stage)
+    attempts = int(env._backflip_curriculum_attempts)
+    if attempts >= min_attempts:
+        rate = env._backflip_curriculum_successes / max(1, attempts)
+        env._backflip_curriculum_last_rate = rate
+        stand_attempts = int(env._backflip_curriculum_stand_attempts)
+        stand_rate = env._backflip_curriculum_stand_successes / max(1, stand_attempts)
+        env._backflip_curriculum_last_stand_rate = stand_rate
+        env._backflip_curriculum_last_stand_landing_rate = (
+            env._backflip_curriculum_stand_landings / max(1, stand_attempts)
+        )
+        env._backflip_curriculum_last_stand_invalid_rate = (
+            env._backflip_curriculum_stand_invalid / max(1, stand_attempts)
+        )
+        env._backflip_curriculum_last_stand_rotation_deg = math.degrees(
+            env._backflip_curriculum_stand_rotation_sum / max(1, stand_attempts)
+        )
+        env._backflip_curriculum_last_stand_clearance = (
+            env._backflip_curriculum_stand_clearance_sum / max(1, stand_attempts)
+        )
+        env._backflip_curriculum_last_stand_foot_drop = (
+            env._backflip_curriculum_stand_foot_drop_sum / max(1, stand_attempts)
+        )
+        env._backflip_curriculum_last_stand_readiness = (
+            env._backflip_curriculum_stand_readiness_sum / max(1, stand_attempts)
+        )
+        threshold = float(stages[stage_index].get("advance_success", 1.1))
+        stand_threshold = float(stages[stage_index].get("advance_stand_success", 0.0))
+        required_windows = int(stages[stage_index].get("required_windows", 2))
+        stand_qualified = stand_attempts >= min_stand_attempts and stand_rate >= stand_threshold
+        if rate >= threshold and stand_qualified and stage_index + 1 < len(stages):
+            env._backflip_curriculum_qualified_windows += 1
+            if env._backflip_curriculum_qualified_windows >= required_windows:
+                stage_index += 1
+                env._backflip_curriculum_stage = stage_index
+                env._backflip_curriculum_qualified_windows = 0
+        else:
+            env._backflip_curriculum_qualified_windows = 0
+        env._backflip_curriculum_attempts = 0
+        env._backflip_curriculum_successes = 0
+        env._backflip_curriculum_stand_attempts = 0
+        env._backflip_curriculum_stand_successes = 0
+        env._backflip_curriculum_stand_landings = 0
+        env._backflip_curriculum_stand_invalid = 0
+        env._backflip_curriculum_stand_rotation_sum = 0.0
+        env._backflip_curriculum_stand_clearance_sum = 0.0
+        env._backflip_curriculum_stand_foot_drop_sum = 0.0
+        env._backflip_curriculum_stand_readiness_sum = 0.0
+
+    current = stages[stage_index]
+    env.event_manager.get_term_cfg(event_name).params.update(current["params"])
+    if "action_rate_weight" in current:
+        env.reward_manager.get_term_cfg(action_rate_reward_name).weight = current["action_rate_weight"]
+    if "body_contact_weight" in current:
+        env.reward_manager.get_term_cfg(body_contact_reward_name).weight = current["body_contact_weight"]
+    return {
+        "stage": torch.tensor(float(stage_index), device=env.device),
+        "success_rate": torch.tensor(float(env._backflip_curriculum_last_rate), device=env.device),
+        "stand_success_rate": torch.tensor(
+            float(env._backflip_curriculum_last_stand_rate), device=env.device
+        ),
+        "stand_landing_rate": torch.tensor(
+            float(env._backflip_curriculum_last_stand_landing_rate), device=env.device
+        ),
+        "stand_invalid_rate": torch.tensor(
+            float(env._backflip_curriculum_last_stand_invalid_rate), device=env.device
+        ),
+        "stand_mean_rotation_deg": torch.tensor(
+            float(env._backflip_curriculum_last_stand_rotation_deg), device=env.device
+        ),
+        "stand_mean_clearance_m": torch.tensor(
+            float(env._backflip_curriculum_last_stand_clearance), device=env.device
+        ),
+        "stand_mean_foot_drop_m": torch.tensor(
+            float(env._backflip_curriculum_last_stand_foot_drop), device=env.device
+        ),
+        "stand_mean_readiness": torch.tensor(
+            float(env._backflip_curriculum_last_stand_readiness), device=env.device
+        ),
+        "stand_attempts": torch.tensor(
+            float(env._backflip_curriculum_stand_attempts), device=env.device
+        ),
+        "attempts": torch.tensor(float(env._backflip_curriculum_attempts), device=env.device),
+        "qualified_windows": torch.tensor(
+            float(env._backflip_curriculum_qualified_windows), device=env.device
+        ),
+    }
+
+
 def face_down_prob_curriculum(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -4631,6 +4967,69 @@ class RelativeHeadingVelocityCommandCfg(UniformVelocityCommandCfg):
         return RelativeHeadingVelocityCommand(self, env)
 
 
+class RaceLineVelocityCommand(VelocityCommandCommandOnly):
+    """Expose closed-loop race-line correction through the existing yaw slot.
+
+    The locomotion actor remains a 61D deployable policy. It learns how to
+    turn in response to ``cmd[2]`` while this outer loop uses world heading,
+    cross-track position, and yaw rate to calculate that small correction.
+    This is the same measurable controller used by Policy Bench and the arena.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._env_ref = env
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        super()._resample_command(env_ids)
+        self.vel_command_b[env_ids, 2] = 0.0
+
+    def _update_command(self) -> None:
+        quat = self.robot.data.root_link_quat_w
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        yaw = torch.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+        lateral_error = (
+            self.robot.data.root_link_pos_w[:, 1]
+            - self._env_ref.scene.env_origins[:, 1]
+        )
+        yaw_rate = self.robot.data.root_link_ang_vel_w[:, 2]
+        correction = (
+            -self.cfg.yaw_kp * yaw
+            -self.cfg.lateral_kp * lateral_error
+            -self.cfg.yaw_kd * yaw_rate
+        )
+        self.vel_command_b[:, 2] = torch.nan_to_num(correction).clamp(
+            -self.cfg.max_correction, self.cfg.max_correction
+        )
+        # ``UniformVelocityCommand._update_command`` normally applies the
+        # standing mask after updating the command.  RaceLine owns the update
+        # path so it must preserve that behavior explicitly; otherwise
+        # ``rel_standing_envs`` only marks environments as standing while their
+        # sampled linear command remains active, silently disabling stand/brake
+        # practice.
+        standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
+        if len(standing_env_ids) > 0:
+            self.vel_command_b[standing_env_ids, :] = 0.0
+            self.vel_command_w[standing_env_ids, :] = 0.0
+
+    def _update_metrics(self) -> None:
+        pass
+
+
+@_dataclass(kw_only=True)
+class RaceLineVelocityCommandCfg(UniformVelocityCommandCfg):
+    yaw_kp: float = 0.55
+    lateral_kp: float = 0.10
+    yaw_kd: float = 0.08
+    max_correction: float = 0.18
+
+    def build(self, env: ManagerBasedRlEnv) -> "RaceLineVelocityCommand":
+        return RaceLineVelocityCommand(self, env)
+
+
 def heading_tracking_reward(
     env: ManagerBasedRlEnv,
     command_name: str,
@@ -4747,6 +5146,7 @@ def glide_reward(
     command_name: str,
     vel_ref: float = 0.2,
     stillness_std: float = 5.0,
+    normalize_joint_count: bool = False,
     asset_cfg: SceneEntityCfg = SceneEntityCfg(
         "robot", joint_names=(r".*(hip|knee|ankle).*",)
     ),
@@ -4764,8 +5164,9 @@ def glide_reward(
       the earlier broken glide, which omitted it and let a two-blade swizzle-coast
       farm the reward and regress the gait.
     - forward_gate = clamp(v_fwd,0,vel_ref)/vel_ref → 0 when not moving forward.
-    - stillness = exp(-Σ leg_joint_vel² / stillness_std²) → high only when legs
-      are quiet; a kick (fast joint motion) gets ~0, so only a real glide pays.
+    - stillness = exp(-Σ leg_joint_vel² / stillness_std²) by default. Set
+      ``normalize_joint_count`` to use the mean square, keeping the threshold
+      meaningful when the selected joint group contains many degrees of freedom.
     - active on push/coast only (cmd_x >= 0); silent on brake.
     """
     from mjlab.sensor import ContactSensor
@@ -4779,14 +5180,281 @@ def glide_reward(
         forward_gate = torch.ones(env.num_envs, device=env.device)
 
     asset: Entity = env.scene[asset_cfg.name]
-    joint_vel_sq = torch.sum(
-        torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1
+    joint_vel_square = torch.square(asset.data.joint_vel[:, asset_cfg.joint_ids])
+    joint_vel_sq = (
+        torch.mean(joint_vel_square, dim=1)
+        if normalize_joint_count
+        else torch.sum(joint_vel_square, dim=1)
     )
     stillness = torch.exp(-joint_vel_sq / stillness_std ** 2)
 
     cmd_x = env.command_manager.get_command(command_name)[:, 0]
     active = (cmd_x >= 0.0).float()
     return single * forward_gate * stillness * active
+
+
+def speed_discovery_forward_velocity(
+    env: ManagerBasedRlEnv,
+    safety_cap_mps: float = 7.5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Signed body-forward chassis velocity for unconstrained speed discovery.
+
+    This is intentionally not command tracking: reward keeps increasing after
+    the duck exceeds the current curriculum milestone.  The cap is above the
+    6.7 m/s discovery goal and exists only to bound catastrophic simulator
+    impulses. Body-forward matches the published Hannes discovery metric; net
+    world progress and heading are deferred to the Race5 qualification stage.
+
+    The function also accumulates per-episode mean and peak speeds for the
+    performance-gated curriculum.  These buffers are policy diagnostics, not
+    observations, so the deployable actor remains 61D.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    speed = torch.nan_to_num(
+        asset.data.root_link_lin_vel_b[:, 0], nan=0.0, posinf=safety_cap_mps,
+        neginf=-safety_cap_mps,
+    ).clamp(-safety_cap_mps, safety_cap_mps)
+
+    if (
+        not hasattr(env, "_speed_discovery_sum")
+        or env._speed_discovery_sum.shape[0] != env.num_envs
+    ):
+        env._speed_discovery_sum = torch.zeros(env.num_envs, device=env.device)
+        env._speed_discovery_count = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
+        env._speed_discovery_peak = torch.full(
+            (env.num_envs,), -float("inf"), device=env.device
+        )
+
+    # The curriculum reads and clears terminal episodes during reset.  This
+    # guard also initializes correctly if a manager calls the reward before the
+    # first curriculum reset.
+    just_started = env.episode_length_buf <= 1
+    env._speed_discovery_sum[just_started] = 0.0
+    env._speed_discovery_count[just_started] = 0
+    env._speed_discovery_peak[just_started] = -float("inf")
+    env._speed_discovery_sum += speed
+    env._speed_discovery_count += 1
+    env._speed_discovery_peak = torch.maximum(env._speed_discovery_peak, speed)
+    return speed
+
+
+def speed_discovery_forward_velocity_squared(
+    env: ManagerBasedRlEnv,
+    safety_cap_mps: float = 7.5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Signed quadratic speed pressure without command-target saturation."""
+    asset: Entity = env.scene[asset_cfg.name]
+    speed = torch.nan_to_num(
+        asset.data.root_link_lin_vel_b[:, 0], nan=0.0, posinf=safety_cap_mps,
+        neginf=-safety_cap_mps,
+    ).clamp(-safety_cap_mps, safety_cap_mps)
+    return speed * torch.abs(speed)
+
+
+def speed_discovery_target_progress(
+    env: ManagerBasedRlEnv,
+    target_speed_mps: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Dense signed progress toward the current performance-gated milestone.
+
+    This term saturates at the milestone, but the dominant raw linear and
+    quadratic rewards do not.  It supplies a well-scaled gradient as the
+    curriculum moves from 2.5 to 6.7 m/s without sending an out-of-distribution
+    command into the warm-start actor.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    speed = torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 0], nan=0.0)
+    target = max(float(target_speed_mps), 0.05)
+    return torch.clamp(speed / target, min=-1.0, max=1.0)
+
+
+def speed_discovery_alive(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Small survival reward; terminal failures receive zero on their last step."""
+    return (~env.termination_manager.terminated).to(dtype=torch.float32)
+
+
+def speed_discovery_fall(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """One only on a fell_over terminal step, for an explicit failure charge."""
+    if "fell_over" not in env.termination_manager.active_terms:
+        return torch.zeros(env.num_envs, device=env.device)
+    return env.termination_manager.get_term("fell_over").to(dtype=torch.float32)
+
+
+def speed_discovery_mean_forward_velocity(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Unclipped body-forward velocity metric in metres per second."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 0], nan=0.0)
+
+
+def speed_discovery_mean_world_forward_velocity(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """World-X velocity diagnostic; not part of the discovery objective."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 0], nan=0.0)
+
+
+def speed_discovery_mean_forward_velocity_mph(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Unclipped body-forward velocity metric in miles per hour."""
+    return speed_discovery_mean_forward_velocity(env, asset_cfg) * 2.2369362921
+
+
+def speed_discovery_peak_forward_velocity(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Per-episode peak velocity buffer, intended for a ``reduce='last'`` metric."""
+    if not hasattr(env, "_speed_discovery_peak"):
+        return torch.zeros(env.num_envs, device=env.device)
+    return torch.nan_to_num(env._speed_discovery_peak, nan=0.0, neginf=0.0)
+
+
+def speed_discovery_survival_fraction(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Fraction of the configured episode horizon survived so far."""
+    horizon = max(int(env.max_episode_length), 1)
+    return torch.clamp(env.episode_length_buf.float() / horizon, 0.0, 1.0)
+
+
+def speed_discovery_performance_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    target_reward_name: str,
+    stages: list[dict],
+    min_attempts: int = 4096,
+    required_windows: int = 2,
+    effort_command: float = 0.8,
+    friction_event_name: str | None = None,
+) -> dict[str, torch.Tensor]:
+    """Raise speed milestones only after sustained speed *and* survival qualify.
+
+    Each completed episode contributes its true mean body-forward velocity,
+    peak velocity, and survived fraction.  A stage advances only after
+    ``required_windows`` independent windows satisfy both the configured mean
+    speed and survival thresholds.  Training iteration is never an advancement
+    criterion.
+    """
+    if not stages:
+        raise ValueError("speed discovery curriculum requires at least one stage")
+    if not hasattr(env, "_speed_discovery_stage"):
+        env._speed_discovery_stage = 0
+        env._speed_discovery_attempts = 0
+        env._speed_discovery_speed_sum = 0.0
+        env._speed_discovery_survival_sum = 0.0
+        env._speed_discovery_window_peak = 0.0
+        env._speed_discovery_last_mean = 0.0
+        env._speed_discovery_last_survival = 0.0
+        env._speed_discovery_last_peak = 0.0
+        env._speed_discovery_qualified_windows = 0
+
+    if env_ids is None or isinstance(env_ids, slice):
+        ids = torch.arange(env.num_envs, device=env.device)
+    else:
+        ids = env_ids.to(device=env.device, dtype=torch.long)
+
+    if hasattr(env, "_speed_discovery_count") and len(ids) > 0:
+        valid = env._speed_discovery_count[ids] > 0
+        completed = ids[valid]
+        if len(completed) > 0:
+            counts = env._speed_discovery_count[completed].float().clamp(min=1.0)
+            episode_means = env._speed_discovery_sum[completed] / counts
+            survival = torch.clamp(
+                env.episode_length_buf[completed].float()
+                / max(int(env.max_episode_length), 1),
+                0.0,
+                1.0,
+            )
+            peaks = torch.nan_to_num(
+                env._speed_discovery_peak[completed], nan=0.0, neginf=0.0
+            )
+            env._speed_discovery_attempts += int(len(completed))
+            env._speed_discovery_speed_sum += float(episode_means.sum().item())
+            env._speed_discovery_survival_sum += float(survival.sum().item())
+            env._speed_discovery_window_peak = max(
+                float(env._speed_discovery_window_peak), float(peaks.max().item())
+            )
+            env._speed_discovery_sum[completed] = 0.0
+            env._speed_discovery_count[completed] = 0
+            env._speed_discovery_peak[completed] = -float("inf")
+
+    stage_index = int(env._speed_discovery_stage)
+    attempts = int(env._speed_discovery_attempts)
+    if attempts >= min_attempts:
+        mean_speed = env._speed_discovery_speed_sum / max(attempts, 1)
+        mean_survival = env._speed_discovery_survival_sum / max(attempts, 1)
+        env._speed_discovery_last_mean = mean_speed
+        env._speed_discovery_last_survival = mean_survival
+        env._speed_discovery_last_peak = env._speed_discovery_window_peak
+        stage = stages[stage_index]
+        qualified = (
+            mean_speed >= float(stage.get("advance_mean_speed_mps", float("inf")))
+            and mean_survival >= float(stage.get("advance_survival_fraction", 1.0))
+        )
+        if qualified and stage_index + 1 < len(stages):
+            env._speed_discovery_qualified_windows += 1
+            if env._speed_discovery_qualified_windows >= required_windows:
+                stage_index += 1
+                env._speed_discovery_stage = stage_index
+                env._speed_discovery_qualified_windows = 0
+        else:
+            env._speed_discovery_qualified_windows = 0
+        env._speed_discovery_attempts = 0
+        env._speed_discovery_speed_sum = 0.0
+        env._speed_discovery_survival_sum = 0.0
+        env._speed_discovery_window_peak = 0.0
+
+    current = stages[stage_index]
+    target = float(current["target_speed_mps"])
+    current_effort_command = float(current.get("effort_command", effort_command))
+    command_term = env.command_manager.get_term(command_name)
+    # Most discovery stages keep a stable full-effort token.  A continuation
+    # may explicitly expose larger commands one performance-gated stage at a
+    # time, allowing the observation normalizer and actor to adapt without a
+    # single out-of-distribution jump.
+    command_term.cfg.ranges.lin_vel_x = (
+        current_effort_command,
+        current_effort_command,
+    )
+    env.reward_manager.get_term_cfg(target_reward_name).params[
+        "target_speed_mps"
+    ] = target
+    wheel_friction = float(current.get("wheel_friction", 0.0))
+    if friction_event_name is not None:
+        # Mutate the EventManager copy; cfg.events was deep-copied at manager
+        # construction.  The value is applied to each environment at its next
+        # reset, so a qualifying window never changes physics mid-episode.
+        event_cfg = env.event_manager.get_term_cfg(friction_event_name)
+        event_cfg.params["ranges"] = (wheel_friction, wheel_friction)
+
+    device = env.device
+    return {
+        "stage": torch.tensor(float(stage_index), device=device),
+        "target_speed_mps": torch.tensor(target, device=device),
+        "target_speed_mph": torch.tensor(target * 2.2369362921, device=device),
+        "effort_command_mps": torch.tensor(current_effort_command, device=device),
+        "window_mean_speed_mps": torch.tensor(
+            float(env._speed_discovery_last_mean), device=device
+        ),
+        "window_survival_fraction": torch.tensor(
+            float(env._speed_discovery_last_survival), device=device
+        ),
+        "window_peak_speed_mps": torch.tensor(
+            float(env._speed_discovery_last_peak), device=device
+        ),
+        "qualified_windows": torch.tensor(
+            float(env._speed_discovery_qualified_windows), device=device
+        ),
+        "wheel_frictionloss": torch.tensor(wheel_friction, device=device),
+    }
 
 
 def leg_symmetry_reward(
@@ -4988,13 +5656,20 @@ class GroundPickPhaseCommand(UniformVelocityCommand):
         # at phase 0 from standing. Default True keeps the historical ground_pick
         # behavior (random phase to decorrelate envs).
         self._randomize_phase = bool(getattr(cfg, "randomize_phase", True))
+        self._rollin_phase = bool(getattr(cfg, "rollin_phase", False))
 
     @property
     def command(self) -> torch.Tensor:
         return self.vel_command_b
 
     def compute(self, dt: float) -> None:
-        self._gp_phase = (self._gp_phase + dt / self._period) % 1.0
+        if self._rollin_phase and hasattr(self._env, "_frontflip_rollin_handoff"):
+            time_s = self._env.episode_length_buf.to(torch.float32) * self._env.step_dt
+            self._gp_phase = torch.clamp(
+                time_s - self._env._frontflip_rollin_handoff, min=0.0
+            ) / self._period % 1.0
+        else:
+            self._gp_phase = (self._gp_phase + dt / self._period) % 1.0
         self.vel_command_b[:, 0] = torch.cos(2 * torch.pi * self._gp_phase)
         self.vel_command_b[:, 1] = torch.sin(2 * torch.pi * self._gp_phase)
         self.vel_command_b[:, 2] = 0.0
@@ -5024,6 +5699,7 @@ class GroundPickPhaseCommandCfg(UniformVelocityCommandCfg):
     class_type: type = GroundPickPhaseCommand
     period: float = 4.0  # cycle length in seconds; sitstand uses 8.0
     randomize_phase: bool = True  # False -> each episode starts at phase 0 (standing)
+    rollin_phase: bool = False  # Hold phase 0 until a physical roll-in hands off.
 
     def build(self, env: ManagerBasedRlEnv) -> "GroundPickPhaseCommand":
         return GroundPickPhaseCommand(self, env)
@@ -6874,6 +7550,23 @@ def _roller_backflip_state(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, ...]:
         env._roller_backflip_landed = b.clone()
         env._roller_backflip_invalid = b.clone()
         env._roller_backflip_just_landed = b.clone()
+        env._roller_backflip_demo_reset = b.clone()
+        env._roller_backflip_assist_omega = z.clone()
+        env._roller_backflip_readiness_max = z.clone()
+        env._roller_backflip_readiness_paid = z.clone()
+        env._roller_backflip_peak_takeoff_pitch = z.clone()
+        env._roller_backflip_paid_takeoff_pitch = z.clone()
+        env._roller_frontflip_peak_supported_angmom = z.clone()
+        env._roller_frontflip_paid_supported_angmom = z.clone()
+        env._roller_frontflip_recovery_max = z.clone()
+        env._roller_frontflip_recovery_paid = z.clone()
+        env._roller_frontflip_stable_steps = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
+        env._roller_frontflip_stable_latch = b.clone()
+        env._roller_frontflip_reset_kind = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
         env._roller_backflip_last_update_step = -1
     return (
         env._roller_backflip_accum,
@@ -6889,6 +7582,18 @@ def _roller_backflip_state(env: ManagerBasedRlEnv) -> tuple[torch.Tensor, ...]:
     )
 
 
+def _reset_roller_frontflip_recovery_state(
+    env: ManagerBasedRlEnv, env_ids: torch.Tensor
+) -> None:
+    """Reset post-landing recovery and durable-success accounting."""
+    env._roller_frontflip_recovery_max[env_ids] = 0.0
+    env._roller_frontflip_recovery_paid[env_ids] = 0.0
+    env._roller_frontflip_stable_steps[env_ids] = 0
+    env._roller_frontflip_stable_latch[env_ids] = False
+    env._roller_frontflip_peak_supported_angmom[env_ids] = 0.0
+    env._roller_frontflip_paid_supported_angmom[env_ids] = 0.0
+
+
 def _contact_any(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
     sensor = env.scene.sensors.get(sensor_name)
     if sensor is None or sensor.data.found is None:
@@ -6901,15 +7606,21 @@ def reset_roller_backflip_state(
     env_ids: torch.Tensor,
     demonstration: dict,
     demo_prob: float = 0.65,
+    demo_frame_range: tuple[int, int] | None = None,
+    demo_progress_range_deg: tuple[float, float] | None = None,
     assist_vz_range: tuple[float, float] = (0.6, 0.9),
     assist_omega_range: tuple[float, float] = (10.0, 15.0),
+    assist_turns_range: tuple[float, float] | None = None,
+    unassisted_stand_prob: float = 0.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> None:
     """Mix standing assisted starts with states from the accepted front flip.
 
     The demonstration is used only as a reverse-curriculum reset distribution;
-    no time-indexed waypoint reward is present. Assistance is applied as root
-    velocity at reset and is scheduled to zero by the environment curriculum.
+    no time-indexed waypoint reward is present. Vertical assistance is applied
+    at reset; pitch assistance is stored and ramped only after takeoff so the
+    body is not rotated through the terrain. Both are scheduled to zero by the
+    environment curriculum.
     """
     if env_ids is None or len(env_ids) == 0:
         return
@@ -6921,6 +7632,17 @@ def reset_roller_backflip_state(
         values[env_ids] = 0.0
     for values in state[5:]:
         values[env_ids] = False
+    _reset_roller_frontflip_recovery_state(env, env_ids)
+    env._roller_backflip_peak_takeoff_pitch[env_ids] = 0.0
+    env._roller_backflip_paid_takeoff_pitch[env_ids] = 0.0
+    env._roller_backflip_assist_omega[env_ids] = 0.0
+    env._roller_backflip_readiness_max[env_ids] = 0.0
+    env._roller_backflip_readiness_paid[env_ids] = 0.0
+    frame_cache = getattr(env, "_roller_backflip_demo_frame_start", None)
+    if frame_cache is None:
+        frame_cache = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        setattr(env, "_roller_backflip_demo_frame_start", frame_cache)
+    frame_cache[env_ids] = 0
 
     cache_key = "_roller_backflip_demo_cache"
     cache = getattr(env, cache_key, None)
@@ -6932,12 +7654,36 @@ def reset_roller_backflip_state(
         setattr(env, cache_key, cache)
 
     is_demo = torch.rand(len(env_ids), device=env.device) < demo_prob
+    env._roller_backflip_demo_reset[env_ids] = is_demo
     demo_env_ids = env_ids[is_demo]
     stand_env_ids = env_ids[~is_demo]
     servo_ids = _servo_joint_ids(env, asset)
 
     if len(demo_env_ids) > 0:
-        sample = torch.randint(len(cache["progress"]), (len(demo_env_ids),), device=env.device)
+        if demo_progress_range_deg is not None:
+            low = math.radians(demo_progress_range_deg[0])
+            high = math.radians(demo_progress_range_deg[1])
+            candidates = torch.nonzero(
+                (cache["progress"] >= low) & (cache["progress"] <= high),
+                as_tuple=False,
+            ).flatten()
+            if len(candidates) == 0:
+                midpoint = 0.5 * (low + high)
+                candidates = torch.argmin(
+                    torch.abs(cache["progress"] - midpoint)
+                ).reshape(1)
+            sample = candidates[
+                torch.randint(
+                    len(candidates), (len(demo_env_ids),), device=env.device
+                )
+            ]
+        else:
+            frame_start, frame_end = demo_frame_range or (0, len(cache["progress"]))
+            frame_start = max(0, min(int(frame_start), len(cache["progress"]) - 1))
+            frame_end = max(frame_start + 1, min(int(frame_end), len(cache["progress"])))
+            sample = torch.randint(
+                frame_start, frame_end, (len(demo_env_ids),), device=env.device
+            )
         env.sim.data.qpos[demo_env_ids, 2] = cache["root_qpos"][sample, 2]
         env.sim.data.qpos[demo_env_ids, 3:7] = cache["root_qpos"][sample, 3:7]
         env.sim.data.qvel[demo_env_ids, :6] = cache["root_qvel"][sample]
@@ -6946,6 +7692,7 @@ def reset_roller_backflip_state(
         env.sim.data.qpos[demo_env_ids.unsqueeze(1), qpos_cols.unsqueeze(0)] = cache["joint_pos"][sample]
         env.sim.data.qvel[demo_env_ids.unsqueeze(1), qvel_cols.unsqueeze(0)] = cache["joint_vel"][sample]
         progress = cache["progress"][sample]
+        frame_cache[demo_env_ids] = sample
         accum[demo_env_ids] = progress
         maximum[demo_env_ids] = progress
         paid[demo_env_ids] = progress
@@ -6953,18 +7700,790 @@ def reset_roller_backflip_state(
         takeoff[demo_env_ids] = True
 
     if len(stand_env_ids) > 0:
-        env.sim.data.qvel[stand_env_ids, 2] = (
+        assist_vz = (
             torch.rand(len(stand_env_ids), device=env.device)
             * (assist_vz_range[1] - assist_vz_range[0])
             + assist_vz_range[0]
         )
-        env.sim.data.qvel[stand_env_ids, 4] = (
-            torch.rand(len(stand_env_ids), device=env.device)
-            * (assist_omega_range[1] - assist_omega_range[0])
-            + assist_omega_range[0]
+        env.sim.data.qvel[stand_env_ids, 2] = assist_vz
+        if assist_turns_range is None:
+            assist_omega = (
+                torch.rand(len(stand_env_ids), device=env.device)
+                * (assist_omega_range[1] - assist_omega_range[0])
+                + assist_omega_range[0]
+            )
+        else:
+            turns = (
+                torch.rand(len(stand_env_ids), device=env.device)
+                * (assist_turns_range[1] - assist_turns_range[0])
+                + assist_turns_range[0]
+            )
+            # The step event ramps pitch only after the root has gained 2 cm
+            # clearance and reaches full assistance at 10 cm. Match the final
+            # rate to the remaining ballistic flight time from that point.
+            full_clearance = 0.10
+            discriminant = torch.clamp(
+                assist_vz.pow(2) - 2.0 * 9.81 * full_clearance, min=0.0
+            )
+            time_to_full = (
+                assist_vz - torch.sqrt(discriminant)
+            ) / 9.81
+            flight_time = 2.0 * torch.clamp(assist_vz, min=0.05) / 9.81
+            remaining_time = torch.clamp(flight_time - time_to_full, min=0.10)
+            assist_omega = turns * (2.0 * math.pi) / remaining_time
+            assist_omega = torch.where(assist_vz > 0.0, assist_omega, torch.zeros_like(assist_omega))
+        unassisted = torch.rand(len(stand_env_ids), device=env.device) < max(
+            0.0, min(1.0, unassisted_stand_prob)
         )
+        env.sim.data.qvel[stand_env_ids, 2] = torch.where(
+            unassisted,
+            torch.zeros_like(env.sim.data.qvel[stand_env_ids, 2]),
+            env.sim.data.qvel[stand_env_ids, 2],
+        )
+        assist_omega = torch.where(unassisted, torch.zeros_like(assist_omega), assist_omega)
+        env._roller_backflip_assist_omega[stand_env_ids] = assist_omega
         supported[stand_env_ids] = True
     env._roller_backflip_last_update_step = -1
+
+
+def reset_roller_frontflip_landing_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    demonstration: dict,
+    progress_range_deg: tuple[float, float] = (330.0, 355.0),
+    height_offset_range: tuple[float, float] = (0.03, 0.06),
+    forward_speed_range: tuple[float, float] = (0.20, 0.50),
+    velocity_scale_range: tuple[float, float] = (0.70, 0.90),
+    offaxis_scale: float = 0.0,
+    stand_height: float = 0.115,
+    wheel_radius: float = 0.0175,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Reset into a real descending late-flight state for landing practice.
+
+    The source pose, joint state, root velocity, and accumulated forward
+    rotation come from the accepted simulator trajectory.  We translate the
+    state to the current environment, add a small amount of ballistic height,
+    and keep wheel angular velocity consistent with forward speed.  No force,
+    velocity impulse, or reference action is applied after reset: the policy
+    must align and land on the four skate tires under normal physics.
+
+    ``progress_range_deg`` is widened backward only by the performance-gated
+    curriculum below.  Paying rotation from zero at these starts would let PPO
+    farm the reset, so all potential buffers begin at the sampled progress.
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    asset: Entity = env.scene[asset_cfg.name]
+    state = _roller_backflip_state(env)
+    accum, maximum, paid, peak, paid_clear, supported, takeoff, landed, invalid, just_landed = state
+    for values in state[:5]:
+        values[env_ids] = 0.0
+    for values in state[5:]:
+        values[env_ids] = False
+    _reset_roller_frontflip_recovery_state(env, env_ids)
+    env._roller_backflip_peak_takeoff_pitch[env_ids] = 0.0
+    env._roller_backflip_paid_takeoff_pitch[env_ids] = 0.0
+    env._roller_backflip_assist_omega[env_ids] = 0.0
+    env._roller_backflip_readiness_max[env_ids] = 0.0
+    env._roller_backflip_readiness_paid[env_ids] = 0.0
+
+    cache_key = "_roller_frontflip_landing_cache"
+    cache = getattr(env, cache_key, None)
+    if cache is None:
+        cache = {
+            key: torch.as_tensor(value, dtype=torch.float32, device=env.device)
+            for key, value in demonstration.items()
+        }
+        setattr(env, cache_key, cache)
+
+    low = math.radians(progress_range_deg[0])
+    high = math.radians(progress_range_deg[1])
+    progress = cache["progress"]
+    descending = cache["root_qvel"][:, 2] < 0.05
+    candidates = torch.nonzero(
+        (progress >= low) & (progress <= high) & descending,
+        as_tuple=False,
+    ).flatten()
+    if len(candidates) == 0:
+        candidates = torch.nonzero(
+            (progress >= low) & (progress <= high), as_tuple=False
+        ).flatten()
+    if len(candidates) == 0:
+        midpoint = 0.5 * (low + high)
+        candidates = torch.argmin(torch.abs(progress - midpoint)).reshape(1)
+    sample = candidates[
+        torch.randint(len(candidates), (len(env_ids),), device=env.device)
+    ]
+
+    servo_ids = _servo_joint_ids(env, asset)
+    qpos_cols = torch.as_tensor([7 + index for index in servo_ids], device=env.device)
+    qvel_cols = torch.as_tensor([6 + index for index in servo_ids], device=env.device)
+    height_lo, height_hi = height_offset_range
+    height_offset = height_lo + torch.rand(len(env_ids), device=env.device) * (height_hi - height_lo)
+    origin_z = env.scene.terrain.env_origins[env_ids, 2]
+    env.sim.data.qpos[env_ids, 2] = cache["root_qpos"][sample, 2] + height_offset + origin_z
+    env.sim.data.qpos[env_ids, 3:7] = cache["root_qpos"][sample, 3:7]
+    env.sim.data.qpos[env_ids.unsqueeze(1), qpos_cols.unsqueeze(0)] = cache["joint_pos"][sample]
+    env.sim.data.qvel[env_ids.unsqueeze(1), qvel_cols.unsqueeze(0)] = cache["joint_vel"][sample]
+
+    speed_lo, speed_hi = forward_speed_range
+    forward_speed = speed_lo + torch.rand(len(env_ids), device=env.device) * (speed_hi - speed_lo)
+    scale_lo, scale_hi = velocity_scale_range
+    velocity_scale = scale_lo + torch.rand(len(env_ids), device=env.device) * (scale_hi - scale_lo)
+    root_velocity = cache["root_qvel"][sample].clone()
+    root_velocity[:, 0] = forward_speed
+    root_velocity[:, 1] = 0.0
+    root_velocity[:, 2] = -torch.clamp(
+        torch.abs(root_velocity[:, 2]) * velocity_scale, min=0.15, max=1.20
+    )
+    root_velocity[:, 3] *= offaxis_scale
+    root_velocity[:, 4] = torch.clamp(
+        root_velocity[:, 4] * velocity_scale, min=0.50, max=18.0
+    )
+    root_velocity[:, 5] *= offaxis_scale
+    env.sim.data.qvel[env_ids, :6] = root_velocity
+
+    wheel_ids, _ = asset.find_joints(r"^passive_.*wheel$")
+    if wheel_ids:
+        wheel_cols = torch.as_tensor([6 + index for index in wheel_ids], device=env.device)
+        wheel_omega = (forward_speed / wheel_radius).unsqueeze(1)
+        env.sim.data.qvel[env_ids.unsqueeze(1), wheel_cols.unsqueeze(0)] = wheel_omega
+
+    sampled_progress = progress[sample]
+    sampled_clearance = torch.clamp(
+        env.sim.data.qpos[env_ids, 2] - origin_z - stand_height, min=0.0
+    )
+    accum[env_ids] = sampled_progress
+    maximum[env_ids] = sampled_progress
+    paid[env_ids] = sampled_progress
+    peak[env_ids] = sampled_clearance
+    paid_clear[env_ids] = sampled_clearance
+    supported[env_ids] = True
+    takeoff[env_ids] = True
+    env._roller_backflip_demo_reset[env_ids] = True
+    frame_cache = getattr(env, "_roller_backflip_demo_frame_start", None)
+    if frame_cache is None:
+        frame_cache = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        env._roller_backflip_demo_frame_start = frame_cache
+    frame_cache[env_ids] = sample
+    env._roller_backflip_last_update_step = -1
+
+
+def reset_roller_frontflip_integrated_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    demonstration: dict,
+    stand_prob: float = 0.20,
+    flight_prob: float = 0.35,
+    flight_progress_range_deg: tuple[float, float] = (150.0, 315.0),
+    landing_progress_range_deg: tuple[float, float] = (330.0, 355.0),
+    landing_height_offset_range: tuple[float, float] = (0.03, 0.06),
+    landing_forward_speed_range: tuple[float, float] = (0.20, 0.50),
+    landing_velocity_scale_range: tuple[float, float] = (0.70, 0.90),
+    landing_offaxis_scale: float = 0.0,
+    stand_height: float = 0.115,
+    wheel_radius: float = 0.0175,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Stratify resets across launch, flight, and landing without assistance.
+
+    The same actor is trained in every phase.  Standing starts preserve the
+    true launch distribution, mid-flight starts keep the sparse rotation-to-
+    landing bridge on-policy, and accepted late-flight starts protect the clean
+    landing controller.  No forces or velocity assistance are applied after
+    reset; all three slices run under identical task physics.
+    """
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    _roller_backflip_state(env)
+
+    stand_prob = max(0.0, min(1.0, float(stand_prob)))
+    flight_prob = max(0.0, min(1.0 - stand_prob, float(flight_prob)))
+    draw = torch.rand(len(env_ids), device=env.device)
+    stand_mask = draw < stand_prob
+    flight_mask = (draw >= stand_prob) & (draw < stand_prob + flight_prob)
+    landing_mask = ~(stand_mask | flight_mask)
+    stand_ids = env_ids[stand_mask]
+    flight_ids = env_ids[flight_mask]
+    landing_ids = env_ids[landing_mask]
+
+    # Initialize every episode as a genuine unassisted rolling/standing start.
+    # The two reverse-curriculum subsets below then replace only their sampled
+    # physical state, keeping reset accounting identical across phases.
+    reset_roller_backflip_state(
+        env,
+        env_ids,
+        demonstration=demonstration,
+        demo_prob=0.0,
+        assist_vz_range=(0.0, 0.0),
+        assist_omega_range=(0.0, 0.0),
+        assist_turns_range=None,
+        unassisted_stand_prob=1.0,
+        asset_cfg=asset_cfg,
+    )
+    if len(flight_ids) > 0:
+        reset_roller_backflip_state(
+            env,
+            flight_ids,
+            demonstration=demonstration,
+            demo_prob=1.0,
+            demo_progress_range_deg=flight_progress_range_deg,
+            assist_vz_range=(0.0, 0.0),
+            assist_omega_range=(0.0, 0.0),
+            assist_turns_range=None,
+            unassisted_stand_prob=0.0,
+            asset_cfg=asset_cfg,
+        )
+    if len(landing_ids) > 0:
+        reset_roller_frontflip_landing_state(
+            env,
+            landing_ids,
+            demonstration=demonstration,
+            progress_range_deg=landing_progress_range_deg,
+            height_offset_range=landing_height_offset_range,
+            forward_speed_range=landing_forward_speed_range,
+            velocity_scale_range=landing_velocity_scale_range,
+            offaxis_scale=landing_offaxis_scale,
+            stand_height=stand_height,
+            wheel_radius=wheel_radius,
+            asset_cfg=asset_cfg,
+        )
+
+    env._roller_frontflip_reset_kind[stand_ids] = 0
+    env._roller_frontflip_reset_kind[flight_ids] = 1
+    env._roller_frontflip_reset_kind[landing_ids] = 2
+
+
+def reset_roller_frontflip_bridge_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    demonstration: dict,
+    demo_progress_range_deg: tuple[float, float],
+    wheel_radius: float = 0.0175,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Reset into a bridge archive state with rolling-consistent wheel speed."""
+    reset_roller_backflip_state(
+        env,
+        env_ids,
+        demonstration=demonstration,
+        demo_prob=1.0,
+        demo_progress_range_deg=demo_progress_range_deg,
+        assist_vz_range=(0.0, 0.0),
+        assist_omega_range=(0.0, 0.0),
+        assist_turns_range=None,
+        unassisted_stand_prob=0.0,
+        asset_cfg=asset_cfg,
+    )
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    asset: Entity = env.scene[asset_cfg.name]
+    wheel_ids, _ = asset.find_joints(r"^passive_.*wheel$")
+    if wheel_ids:
+        wheel_cols = torch.as_tensor(
+            [6 + index for index in wheel_ids], device=env.device
+        )
+        forward_speed = torch.clamp(env.sim.data.qvel[env_ids, 0], min=0.0)
+        wheel_omega = (forward_speed / wheel_radius).unsqueeze(1)
+        env.sim.data.qvel[
+            env_ids.unsqueeze(1), wheel_cols.unsqueeze(0)
+        ] = wheel_omega
+    # Match the actor's previous-action observation to the control that
+    # produced the archived physical state.  A zero history here is a severe
+    # train/deploy mismatch because V69 hands off from a large tuck command.
+    frame = env._roller_backflip_demo_frame_start[env_ids]
+    cached_absolute = env._roller_backflip_demo_cache.get("action")
+    if cached_absolute is not None:
+        target_action = cached_absolute[frame]
+        env.action_manager._action[env_ids] = target_action
+        env.action_manager._prev_action[env_ids] = target_action
+        env.action_manager._prev_prev_action[env_ids] = target_action
+    env._roller_frontflip_reset_kind[env_ids] = 1
+
+
+def reset_roller_frontflip_rollin_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    demonstration: dict,
+    forward_speed_range: tuple[float, float] = (0.60, 1.00),
+    wheel_radius: float = 0.0175,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Reset upright and rolling before executing the real V69 action prefix."""
+    reset_roller_backflip_state(
+        env,
+        env_ids,
+        demonstration=demonstration,
+        demo_prob=0.0,
+        assist_vz_range=(0.0, 0.0),
+        assist_omega_range=(0.0, 0.0),
+        assist_turns_range=None,
+        unassisted_stand_prob=1.0,
+        asset_cfg=asset_cfg,
+    )
+    if env_ids is None or len(env_ids) == 0:
+        return
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    asset: Entity = env.scene[asset_cfg.name]
+    low, high = map(float, forward_speed_range)
+    forward_speed = low + torch.rand(len(env_ids), device=env.device) * (high - low)
+    env.sim.data.qvel[env_ids, :6] = 0.0
+    env.sim.data.qvel[env_ids, 0] = forward_speed
+    wheel_ids, _ = asset.find_joints(r"^passive_.*wheel$")
+    if wheel_ids:
+        wheel_cols = torch.as_tensor(
+            [6 + index for index in wheel_ids], device=env.device
+        )
+        env.sim.data.qvel[
+            env_ids.unsqueeze(1), wheel_cols.unsqueeze(0)
+        ] = (forward_speed / wheel_radius).unsqueeze(1)
+    env.action_manager._action[env_ids] = 0.0
+    env.action_manager._prev_action[env_ids] = 0.0
+    env.action_manager._prev_prev_action[env_ids] = 0.0
+    env._roller_frontflip_reset_kind[env_ids] = 0
+
+
+def roller_frontflip_landing_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    event_name: str,
+    stages: list[dict],
+    min_attempts: int = 4096,
+    forward_speed_tolerance: float = 1.5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> dict[str, torch.Tensor]:
+    """Move late-flight resets backward only after real skate landings.
+
+    A landing and a quiet upright recovery are tracked separately.  Each stage
+    must pass consecutive independent windows, preventing one lucky batch from
+    exposing the policy to much earlier, faster, and higher flight states.
+    """
+    if not hasattr(env, "_frontflip_landing_curriculum_stage"):
+        env._frontflip_landing_curriculum_stage = 0
+        env._frontflip_landing_attempts = 0
+        env._frontflip_landing_landings = 0
+        env._frontflip_landing_stable = 0
+        env._frontflip_landing_invalid = 0
+        env._frontflip_landing_last_rate = 0.0
+        env._frontflip_landing_last_stable_rate = 0.0
+        env._frontflip_landing_last_invalid_rate = 0.0
+        env._frontflip_landing_qualified_windows = 0
+
+    if env_ids is None or isinstance(env_ids, slice):
+        ids = torch.arange(env.num_envs, device=env.device)
+    else:
+        ids = env_ids.to(env.device, dtype=torch.long)
+    if len(ids) > 0 and hasattr(env, "_roller_backflip_landed"):
+        completed = ids[env.episode_length_buf[ids] >= 1]
+        if len(completed) > 0:
+            asset: Entity = env.scene[asset_cfg.name]
+            landed = env._roller_backflip_landed[completed]
+            invalid = env._roller_backflip_invalid[completed]
+            quat = torch.nan_to_num(asset.data.root_link_quat_w[completed], nan=0.0)
+            up_z = 1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2))
+            lin_raw = torch.nan_to_num(asset.data.root_link_lin_vel_w[completed], nan=99.0)
+            forward_excess = torch.clamp(
+                torch.abs(lin_raw[:, 0]) - forward_speed_tolerance, min=0.0
+            )
+            lin = torch.sqrt(
+                forward_excess.pow(2) + lin_raw[:, 1].pow(2) + lin_raw[:, 2].pow(2)
+            )
+            ang = torch.nan_to_num(asset.data.root_link_ang_vel_b[completed], nan=99.0).norm(dim=-1)
+            stable = landed & ~invalid & (up_z >= math.cos(math.radians(15.0))) & (lin <= 0.35) & (ang <= 3.0)
+            env._frontflip_landing_attempts += len(completed)
+            env._frontflip_landing_landings += int((landed & ~invalid).sum().item())
+            env._frontflip_landing_stable += int(stable.sum().item())
+            env._frontflip_landing_invalid += int(invalid.sum().item())
+
+    stage_index = int(env._frontflip_landing_curriculum_stage)
+    attempts = int(env._frontflip_landing_attempts)
+    if attempts >= min_attempts:
+        landing_rate = env._frontflip_landing_landings / max(1, attempts)
+        stable_rate = env._frontflip_landing_stable / max(1, attempts)
+        invalid_rate = env._frontflip_landing_invalid / max(1, attempts)
+        env._frontflip_landing_last_rate = landing_rate
+        env._frontflip_landing_last_stable_rate = stable_rate
+        env._frontflip_landing_last_invalid_rate = invalid_rate
+        current = stages[stage_index]
+        qualified = (
+            landing_rate >= float(current.get("advance_landing_rate", 1.1))
+            and stable_rate >= float(current.get("advance_stable_rate", 1.1))
+            and invalid_rate <= float(current.get("max_invalid_rate", 1.0))
+        )
+        if qualified and stage_index + 1 < len(stages):
+            env._frontflip_landing_qualified_windows += 1
+            if env._frontflip_landing_qualified_windows >= int(current.get("required_windows", 2)):
+                stage_index += 1
+                env._frontflip_landing_curriculum_stage = stage_index
+                env._frontflip_landing_qualified_windows = 0
+        else:
+            env._frontflip_landing_qualified_windows = 0
+        env._frontflip_landing_attempts = 0
+        env._frontflip_landing_landings = 0
+        env._frontflip_landing_stable = 0
+        env._frontflip_landing_invalid = 0
+
+    env.event_manager.get_term_cfg(event_name).params.update(stages[stage_index]["params"])
+    return {
+        "stage": torch.tensor(float(stage_index), device=env.device),
+        "landing_rate": torch.tensor(float(env._frontflip_landing_last_rate), device=env.device),
+        "stable_rate": torch.tensor(float(env._frontflip_landing_last_stable_rate), device=env.device),
+        "invalid_rate": torch.tensor(float(env._frontflip_landing_last_invalid_rate), device=env.device),
+        "attempts": torch.tensor(float(env._frontflip_landing_attempts), device=env.device),
+        "qualified_windows": torch.tensor(float(env._frontflip_landing_qualified_windows), device=env.device),
+    }
+
+
+def roller_frontflip_bridge_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    event_name: str,
+    stages: list[dict],
+    min_attempts: int = 4096,
+    landing_rotation: float = math.radians(300.0),
+) -> dict[str, torch.Tensor]:
+    """Move a flight-only learner backward from V50 into real V69 states.
+
+    Unlike the earlier integrated curriculum, this task never asks one actor to
+    preserve the launch.  It measures only whether a state drawn from the
+    current bridge slice reaches 300 degrees, lands on skates, and exits stably.
+    Two independent windows are required before the reset range moves earlier.
+    """
+    if not hasattr(env, "_frontflip_bridge_stage"):
+        env._frontflip_bridge_stage = 0
+        env._frontflip_bridge_qualified_windows = 0
+        env._frontflip_bridge_counts = {
+            "attempts": 0,
+            "rotation": 0,
+            "landing": 0,
+            "stable": 0,
+            "invalid": 0,
+        }
+        env._frontflip_bridge_last = {
+            "rotation_rate": 0.0,
+            "landing_rate": 0.0,
+            "stable_rate": 0.0,
+            "invalid_rate": 0.0,
+        }
+
+    if env_ids is None or isinstance(env_ids, slice):
+        ids = torch.arange(env.num_envs, device=env.device)
+    else:
+        ids = env_ids.to(env.device, dtype=torch.long)
+    if len(ids) > 0 and hasattr(env, "_roller_backflip_landed"):
+        completed = ids[env.episode_length_buf[ids] >= 1]
+        if len(completed) > 0:
+            counts = env._frontflip_bridge_counts
+            invalid = env._roller_backflip_invalid[completed]
+            rotation = env._roller_backflip_max[completed] >= landing_rotation
+            landed = env._roller_backflip_landed[completed] & ~invalid
+            stable = env._roller_frontflip_stable_latch[completed] & ~invalid
+            counts["attempts"] += len(completed)
+            counts["rotation"] += int((rotation & ~invalid).sum().item())
+            counts["landing"] += int(landed.sum().item())
+            counts["stable"] += int(stable.sum().item())
+            counts["invalid"] += int(invalid.sum().item())
+
+    counts = env._frontflip_bridge_counts
+    stage_index = int(env._frontflip_bridge_stage)
+    if counts["attempts"] >= min_attempts:
+        attempts = max(1, counts["attempts"])
+        last = env._frontflip_bridge_last
+        for name in ("rotation", "landing", "stable", "invalid"):
+            last[f"{name}_rate"] = counts[name] / attempts
+        current = stages[stage_index]
+        qualified = (
+            last["rotation_rate"] >= float(current.get("advance_rotation_rate", 1.1))
+            and last["landing_rate"] >= float(current.get("advance_landing_rate", 0.0))
+            and last["stable_rate"] >= float(current.get("advance_stable_rate", 0.0))
+            and last["invalid_rate"] <= float(current.get("max_invalid_rate", 1.0))
+        )
+        if qualified and stage_index + 1 < len(stages):
+            env._frontflip_bridge_qualified_windows += 1
+            if env._frontflip_bridge_qualified_windows >= int(current.get("required_windows", 2)):
+                stage_index += 1
+                env._frontflip_bridge_stage = stage_index
+                env._frontflip_bridge_qualified_windows = 0
+        else:
+            env._frontflip_bridge_qualified_windows = 0
+        env._frontflip_bridge_counts = {
+            "attempts": 0,
+            "rotation": 0,
+            "landing": 0,
+            "stable": 0,
+            "invalid": 0,
+        }
+
+    env.event_manager.get_term_cfg(event_name).params.update(stages[stage_index]["params"])
+    return {
+        "stage": torch.tensor(float(stage_index), device=env.device),
+        "qualified_windows": torch.tensor(
+            float(env._frontflip_bridge_qualified_windows), device=env.device
+        ),
+        **{
+            key: torch.tensor(float(value), device=env.device)
+            for key, value in env._frontflip_bridge_last.items()
+        },
+    }
+
+
+def roller_frontflip_integrated_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    event_name: str,
+    stages: list[dict],
+    min_attempts_per_kind: int = 512,
+    landing_rotation: float = math.radians(300.0),
+) -> dict[str, torch.Tensor]:
+    """Advance the phase mixture only on measured physical outcomes.
+
+    Each independent window must contain enough standing, mid-flight, and
+    late-flight episodes.  The gates can therefore protect a clean landing
+    while the mixture moves backward toward a fully unassisted start.
+    """
+    names = ("stand", "flight", "landing")
+    measures = ("attempts", "takeoff", "rotation", "landing", "stable", "invalid")
+    if not hasattr(env, "_frontflip_integrated_stage"):
+        env._frontflip_integrated_stage = 0
+        env._frontflip_integrated_qualified_windows = 0
+        env._frontflip_integrated_counts = {
+            name: {measure: 0 for measure in measures} for name in names
+        }
+        env._frontflip_integrated_last = {
+            f"{name}_{measure}_rate": 0.0
+            for name in names
+            for measure in ("takeoff", "rotation", "landing", "stable", "invalid")
+        }
+        env._frontflip_integrated_last["invalid_rate"] = 0.0
+
+    if env_ids is None or isinstance(env_ids, slice):
+        ids = torch.arange(env.num_envs, device=env.device)
+    else:
+        ids = env_ids.to(env.device, dtype=torch.long)
+    if len(ids) > 0 and hasattr(env, "_roller_backflip_landed"):
+        completed = ids[env.episode_length_buf[ids] >= 1]
+        if len(completed) > 0:
+            kinds = env._roller_frontflip_reset_kind[completed]
+            takeoff = env._roller_backflip_takeoff[completed]
+            rotation = env._roller_backflip_max[completed] >= landing_rotation
+            invalid = env._roller_backflip_invalid[completed]
+            landed = env._roller_backflip_landed[completed] & ~invalid
+            stable = env._roller_frontflip_stable_latch[completed] & ~invalid
+            for kind_index, name in enumerate(names):
+                mask = kinds == kind_index
+                count = int(mask.sum().item())
+                if count == 0:
+                    continue
+                bucket = env._frontflip_integrated_counts[name]
+                bucket["attempts"] += count
+                bucket["takeoff"] += int((takeoff & mask).sum().item())
+                bucket["rotation"] += int((rotation & mask).sum().item())
+                bucket["landing"] += int((landed & mask).sum().item())
+                bucket["stable"] += int((stable & mask).sum().item())
+                bucket["invalid"] += int((invalid & mask).sum().item())
+
+    counts = env._frontflip_integrated_counts
+    ready = all(counts[name]["attempts"] >= min_attempts_per_kind for name in names)
+    stage_index = int(env._frontflip_integrated_stage)
+    if ready:
+        total_attempts = sum(counts[name]["attempts"] for name in names)
+        total_invalid = sum(counts[name]["invalid"] for name in names)
+        last = env._frontflip_integrated_last
+        for name in names:
+            attempts = max(1, counts[name]["attempts"])
+            for measure in ("takeoff", "rotation", "landing", "stable", "invalid"):
+                last[f"{name}_{measure}_rate"] = counts[name][measure] / attempts
+        last["invalid_rate"] = total_invalid / max(1, total_attempts)
+
+        current = stages[stage_index]
+        advance = current.get("advance", {})
+        qualified = True
+        for key, threshold in advance.items():
+            if key == "max_invalid_rate":
+                qualified &= last["invalid_rate"] <= float(threshold)
+            else:
+                qualified &= last.get(key, 0.0) >= float(threshold)
+        if qualified and stage_index + 1 < len(stages):
+            env._frontflip_integrated_qualified_windows += 1
+            if env._frontflip_integrated_qualified_windows >= int(
+                current.get("required_windows", 2)
+            ):
+                stage_index += 1
+                env._frontflip_integrated_stage = stage_index
+                env._frontflip_integrated_qualified_windows = 0
+        else:
+            env._frontflip_integrated_qualified_windows = 0
+        env._frontflip_integrated_counts = {
+            name: {measure: 0 for measure in measures} for name in names
+        }
+
+    env.event_manager.get_term_cfg(event_name).params.update(
+        stages[stage_index]["params"]
+    )
+    result = {
+        "stage": torch.tensor(float(stage_index), device=env.device),
+        "qualified_windows": torch.tensor(
+            float(env._frontflip_integrated_qualified_windows), device=env.device
+        ),
+    }
+    for key, value in env._frontflip_integrated_last.items():
+        result[key] = torch.tensor(float(value), device=env.device)
+    return result
+
+
+
+def roller_backflip_demo_pose_tracking(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Track a dynamically feasible front-flip reference on RSI episodes.
+
+    Matching pose alone allowed the policy to visit the right silhouette with
+    the wrong momentum.  This composite also tracks joint velocity, root
+    orientation, and root velocity, while remaining active only for episodes
+    initialized from the reference-state archive.
+    """
+    demo_reset = getattr(env, "_roller_backflip_demo_reset", None)
+    cache = getattr(env, "_roller_backflip_demo_cache", None)
+    frame_start = getattr(env, "_roller_backflip_demo_frame_start", None)
+    if demo_reset is None or cache is None or frame_start is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    asset: Entity = env.scene[asset_cfg.name]
+    servo_ids = _servo_joint_ids(env, asset)
+    max_frame = cache["joint_pos"].shape[0] - 1
+    step = env.episode_length_buf.to(dtype=torch.long)
+    frame = torch.clamp(frame_start + step, min=0, max=max_frame)
+    target = cache["joint_pos"][frame]
+    actual = asset.data.joint_pos[:, servo_ids]
+    pose_error = ((actual - target) / 0.35).pow(2).mean(dim=-1)
+    target_joint_velocity = cache["joint_vel"][frame]
+    actual_joint_velocity = asset.data.joint_vel[:, servo_ids]
+    joint_velocity_error = ((actual_joint_velocity - target_joint_velocity) / 8.0).pow(2).mean(dim=-1)
+    target_quaternion = cache["root_qpos"][frame, 3:7]
+    actual_quaternion = asset.data.root_link_quat_w
+    quaternion_alignment = torch.clamp(
+        torch.abs(torch.sum(actual_quaternion * target_quaternion, dim=-1)), 0.0, 1.0
+    )
+    orientation_error = 1.0 - quaternion_alignment.pow(2)
+    target_velocity = cache["root_qvel"][frame]
+    actual_velocity = torch.cat((asset.data.root_link_lin_vel_w, asset.data.root_link_ang_vel_b), dim=-1)
+    velocity_scale = torch.tensor([1.0, 1.0, 1.0, 10.0, 10.0, 10.0], device=env.device)
+    velocity_error = ((actual_velocity - target_velocity) / velocity_scale).pow(2).mean(dim=-1)
+    score = torch.exp(
+        -pose_error
+        -0.25 * joint_velocity_error
+        -2.0 * orientation_error
+        -0.5 * velocity_error
+    )
+    return score * demo_reset.float()
+
+
+def roller_backflip_phase_action_rate_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Action smoothness that leaves the explosive launch effectively untaxed.
+
+    The previous curriculum made action-rate cost dominate exactly when PPO
+    needed to invent takeoff.  This keeps only 5% of the configured cost before
+    takeoff, 20% during early flight, and applies the full regularizer only in
+    the late-flight/landing phase.
+    """
+    _roller_backflip_state(env)
+    base = torch.sum(torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1)
+    progress = torch.clamp(env._roller_backflip_max / (2.0 * math.pi), 0.0, 1.0)
+    scale = torch.where(
+        ~env._roller_backflip_takeoff,
+        torch.full_like(progress, 0.05),
+        0.20 + 0.80 * torch.clamp((progress - 0.50) / 0.35, 0.0, 1.0),
+    )
+    return base * scale
+
+
+def roller_backflip_reference_action_tracking(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Anchor early RSI rollouts to the optimized feed-forward joint targets.
+
+    The actor remains a standalone deployable policy: PPO emits the full
+    action, while this term initially makes exploration behave like a bounded
+    residual around the optimized trajectory.  The state/velocity rewards can
+    then move it away from the feed-forward action whenever robustness needs a
+    correction.
+    """
+    demo_reset = getattr(env, "_roller_backflip_demo_reset", None)
+    cache = getattr(env, "_roller_backflip_demo_cache", None)
+    frame_start = getattr(env, "_roller_backflip_demo_frame_start", None)
+    if (
+        demo_reset is None
+        or cache is None
+        or frame_start is None
+        or "action" not in cache
+    ):
+        return torch.zeros(env.num_envs, device=env.device)
+    max_frame = cache["action"].shape[0] - 1
+    frame = torch.clamp(
+        frame_start + env.episode_length_buf.to(dtype=torch.long),
+        min=0,
+        max=max_frame,
+    )
+    target = cache["action"][frame]
+    actual = env.action_manager.action
+    error = ((actual - target) / 0.35).pow(2).mean(dim=-1)
+    return torch.exp(-error) * demo_reset.float()
+
+
+def apply_roller_backflip_assistance(
+    env: ManagerBasedRlEnv,
+    _env_ids: torch.Tensor | None,
+    feet_sensor_name: str,
+    stand_height: float,
+    ramp_start_clearance: float = 0.02,
+    full_clearance: float = 0.10,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Ramp the reset pitch assist only after both wheels leave the terrain.
+
+    Applying the full angular velocity in the reset event rotated the trunk
+    through the ground before the vertical launch created clearance. This
+    per-step event follows the demonstrated launch geometry instead: vertical
+    motion first, then a smooth pitch-rate ramp as clearance grows. Once full
+    assistance is reached, angular momentum is left to the physics and policy.
+    """
+    del _env_ids
+    _roller_backflip_state(env)
+    pending = env._roller_backflip_assist_omega > 0.0
+    if not bool(torch.any(pending)):
+        return
+    # The reset manager may restore root velocity after the reset event. Reassert
+    # a short vertical launch impulse while assistance is pending so the robot
+    # actually clears the ramp threshold before pitch assistance begins.
+    early = pending & (env.episode_length_buf < 3)
+    launch_vz = 2.5
+    current_vz = torch.nan_to_num(env.sim.data.qvel[:, 2], nan=0.0)
+    env.sim.data.qvel[:, 2] = torch.where(
+        early, torch.maximum(current_vz, torch.full_like(current_vz, launch_vz)), current_vz
+    )
+    asset: Entity = env.scene[asset_cfg.name]
+    _, both_airborne = _roller_foot_contact_masks(env, feet_sensor_name)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=stand_height,
+    )
+    clearance = torch.clamp(z - stand_height, min=0.0)
+    span = max(full_clearance - ramp_start_clearance, 1.0e-6)
+    ramp = torch.clamp((clearance - ramp_start_clearance) / span, 0.0, 1.0)
+    eligible = pending & both_airborne & (ramp > 0.0)
+    current = torch.nan_to_num(env.sim.data.qvel[:, 4], nan=0.0)
+    desired = env._roller_backflip_assist_omega * ramp
+    env.sim.data.qvel[:, 4] = torch.where(
+        eligible, torch.maximum(current, desired), current
+    )
+    finished = pending & (
+        (clearance >= full_clearance)
+        | env._roller_backflip_invalid
+        | (env.episode_length_buf > 1) & (env.sim.data.qvel[:, 2] <= 0.0)
+    )
+    env._roller_backflip_assist_omega[finished] = 0.0
 
 
 def _update_roller_backflip_state(
@@ -6997,7 +8516,11 @@ def _update_roller_backflip_state(
     env._roller_backflip_peak_clearance = torch.maximum(
         peak, torch.where(active_flight, clearance, torch.zeros_like(clearance))
     )
-    invalid |= takeoff & _contact_any(env, body_sensor_name)
+    # Any non-skate terrain contact invalidates the maneuver, including during
+    # the preload.  Gating this on takeoff allowed a policy/search primitive to
+    # plant the jaw on the floor at 0.24 s, use it as a third support point,
+    # and still receive clean-flight credit after leaving the ground.
+    invalid |= _contact_any(env, body_sensor_name)
     candidate = takeoff & both_contact & (env._roller_backflip_max >= landing_rotation) & ~invalid
     just_landed[:] = candidate & ~landed
     landed |= candidate
@@ -7047,6 +8570,133 @@ def roller_backflip_clearance_progress(
     return delta / (max(target_clearance, 1e-6) * env.step_dt)
 
 
+def roller_backflip_takeoff_pitch_progress(
+    env: ManagerBasedRlEnv,
+    feet_sensor_name: str,
+    target_pitch_rate: float = 18.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """One-time potential reward for forward angular momentum at launch.
+
+    Only new maximum +Y pitch velocity while both wheels are supported is
+    paid.  The term therefore supplies the missing launch gradient without
+    rewarding prolonged airborne spinning or a crashed policy.
+    """
+    _roller_backflip_state(env)
+    asset: Entity = env.scene[asset_cfg.name]
+    both_contact, _ = _roller_foot_contact_masks(env, feet_sensor_name)
+    omega_y = torch.clamp(
+        torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 1], nan=0.0),
+        min=0.0,
+        max=target_pitch_rate,
+    )
+    frontier = torch.maximum(
+        env._roller_backflip_peak_takeoff_pitch,
+        torch.where(both_contact, omega_y, torch.zeros_like(omega_y)),
+    )
+    env._roller_backflip_peak_takeoff_pitch = frontier
+    delta = torch.clamp(frontier - env._roller_backflip_paid_takeoff_pitch, min=0.0)
+    env._roller_backflip_paid_takeoff_pitch = torch.maximum(
+        env._roller_backflip_paid_takeoff_pitch, frontier
+    )
+    return delta / (max(target_pitch_rate, 1.0e-6) * env.step_dt)
+
+
+def roller_frontflip_supported_pitch_angular_momentum_progress(
+    env: ManagerBasedRlEnv,
+    feet_sensor_name: str,
+    target_momentum: float = 0.055,
+    sensor_index: int = 5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward new whole-robot forward angular momentum before takeoff.
+
+    Base pitch rate can be created by counter-rotating the heavy head and does
+    not prove that the robot will keep rotating once airborne.  MuJoCo's
+    ``subtreeangmom`` sensor measures total angular momentum, so this term pays
+    only a new supported +Y frontier while both skates can still exchange
+    impulse with the floor.  It cannot be farmed after takeoff.
+    """
+    _roller_backflip_state(env)
+    asset: Entity = env.scene[asset_cfg.name]
+    both_contact, _ = _roller_foot_contact_masks(env, feet_sensor_name)
+    cache = env.__dict__.setdefault("_roller_frontflip_sensor_adr_cache", {})
+    key = (id(asset), int(sensor_index))
+    sensor_adr = cache.get(key)
+    if sensor_adr is None:
+        sensor_adr = int(asset.data.model.sensor_adr[sensor_index].item())
+        cache[key] = sensor_adr
+    momentum_y = torch.clamp(
+        torch.nan_to_num(asset.data.data.sensordata[:, sensor_adr + 1], nan=0.0),
+        min=0.0,
+        max=target_momentum,
+    )
+    supported = both_contact & ~env._roller_backflip_takeoff
+    frontier = torch.maximum(
+        env._roller_frontflip_peak_supported_angmom,
+        torch.where(supported, momentum_y, torch.zeros_like(momentum_y)),
+    )
+    delta = torch.clamp(
+        frontier - env._roller_frontflip_paid_supported_angmom, min=0.0
+    )
+    env._roller_frontflip_peak_supported_angmom = frontier
+    env._roller_frontflip_paid_supported_angmom = torch.maximum(
+        env._roller_frontflip_paid_supported_angmom, frontier
+    )
+    return delta / (max(target_momentum, 1.0e-6) * env.step_dt)
+
+
+def roller_frontflip_ballistic_action_prior(
+    env: ManagerBasedRlEnv,
+    knot_times_s: list[float],
+    full_nodes: list[list[float]],
+    action_std: float = 1.0,
+    end_time_s: float = 0.96,
+    decay_steps: int = 7_200,
+    final_scale: float = 0.10,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Softly imitate a searched crouch/head-whip/tuck primitive on real starts.
+
+    The prior is active only for reset-kind 0 (unassisted rolling starts) and
+    only through the launch/tuck window.  It decays during training so PPO can
+    retain the discovered momentum mechanism while replacing the primitive's
+    open-loop crash with its learned feedback landing controller.
+    """
+    if len(knot_times_s) != len(full_nodes) or len(knot_times_s) < 2:
+        raise ValueError("ballistic prior needs matching knot times and nodes")
+    asset: Entity = env.scene[asset_cfg.name]
+    _roller_backflip_state(env)
+    cache = env.__dict__.setdefault("_roller_frontflip_ballistic_prior_cache", {})
+    key = (tuple(float(v) for v in knot_times_s), tuple(tuple(row) for row in full_nodes))
+    tensors = cache.get(key)
+    if tensors is None:
+        times = torch.as_tensor(knot_times_s, dtype=torch.float32, device=env.device)
+        nodes = torch.as_tensor(full_nodes, dtype=torch.float32, device=env.device)
+        if nodes.shape != (len(knot_times_s), env.action_manager.action.shape[-1]):
+            raise ValueError("ballistic prior node width must match action dimension")
+        tensors = (times, nodes)
+        cache[key] = tensors
+    times, nodes = tensors
+    time_s = env.episode_length_buf.to(dtype=torch.float32) * env.step_dt
+    index = torch.bucketize(time_s, times[1:], right=False)
+    index = torch.clamp(index, 0, len(knot_times_s) - 2)
+    t0, t1 = times[index], times[index + 1]
+    blend = torch.clamp((time_s - t0) / torch.clamp(t1 - t0, min=1.0e-6), 0.0, 1.0)
+    target_absolute = nodes[index] + blend.unsqueeze(-1) * (nodes[index + 1] - nodes[index])
+    target_action = target_absolute - _servo_default_joint_pos(env, asset)
+    # A smooth L1 objective keeps a usable gradient even before the actor is
+    # close to the primitive.  The earlier Gaussian saturated to exactly zero
+    # under inherited high-variance exploration and could not teach anything.
+    scaled = (env.action_manager.action - target_action) / action_std
+    score = -torch.sqrt(scaled.pow(2) + 0.01).mean(dim=-1)
+    real_start = env._roller_frontflip_reset_kind == 0
+    active = real_start & (time_s <= end_time_s)
+    steps = float(getattr(env, "common_step_counter", 0))
+    scale = max(final_scale, 1.0 - (1.0 - final_scale) * steps / max(1, decay_steps))
+    return torch.where(active, score * scale, torch.zeros_like(score))
+
+
 def roller_backflip_landing(
     env: ManagerBasedRlEnv,
     feet_sensor_name: str,
@@ -7055,6 +8705,7 @@ def roller_backflip_landing(
     takeoff_clearance: float,
     landing_rotation: float,
     joint_indices: list,
+    forward_speed_tolerance: float = 0.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """One-time controlled upright landing reward after a valid full flip."""
@@ -7068,14 +8719,236 @@ def roller_backflip_landing(
         upright_std=0.3, pose_std=0.5, joint_indices=joint_indices,
         asset_cfg=asset_cfg,
     )
-    lin = torch.nan_to_num(asset.data.root_link_lin_vel_w, nan=0.0).norm(dim=-1)
+    lin_raw = torch.nan_to_num(asset.data.root_link_lin_vel_w, nan=0.0)
+    forward_excess = torch.clamp(
+        torch.abs(lin_raw[:, 0]) - forward_speed_tolerance, min=0.0
+    )
+    lin = torch.sqrt(
+        forward_excess.pow(2) + lin_raw[:, 1].pow(2) + lin_raw[:, 2].pow(2)
+    )
     ang = torch.nan_to_num(asset.data.root_link_ang_vel_b, nan=0.0).norm(dim=-1)
     quiet = torch.exp(-((lin / 0.35) ** 2) - ((ang / 3.0) ** 2))
     return just_landed.float() * pose * quiet / env.step_dt
 
 
+def roller_backflip_landing_readiness_progress(
+    env: ManagerBasedRlEnv,
+    feet_sensor_name: str,
+    body_sensor_name: str,
+    stand_height: float,
+    takeoff_clearance: float,
+    landing_rotation: float,
+    minimum_rotation: float = math.radians(240.0),
+    foot_drop_target: float = 0.10,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", site_names=("left_foot", "right_foot")
+    ),
+) -> torch.Tensor:
+    """Potential reward for putting both skates below the body before impact.
+
+    This is state-gated rather than time-indexed: it activates only late in a
+    real airborne forward rotation and while descending. The score rises when
+    both skate sites move below the trunk, the trunk returns upright, the
+    skates become level with each other, and pitch rate slows. Paying only a
+    new per-episode maximum prevents hovering or cycling near the landing pose
+    from farming reward.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    state = _update_roller_backflip_state(
+        env,
+        feet_sensor_name,
+        body_sensor_name,
+        stand_height,
+        takeoff_clearance,
+        landing_rotation,
+        asset_cfg,
+    )
+    _, maximum, _, _, _, _, takeoff, landed, invalid, _ = state
+    _, both_airborne = _roller_foot_contact_masks(env, feet_sensor_name)
+    descending = env.sim.data.qvel[:, 2] < 0.0
+    gate = (
+        takeoff
+        & both_airborne
+        & descending
+        & ~landed
+        & ~invalid
+        & (maximum >= minimum_rotation)
+    )
+
+    root_z = asset.data.root_link_pos_w[:, 2]
+    foot_z = asset.data.site_pos_w[:, asset_cfg.site_ids, 2]
+    # Both sites must be below the trunk; the higher skate is limiting.
+    minimum_drop = root_z - torch.max(foot_z, dim=-1).values
+    # Keep a useful gradient even when both skates are still above the trunk.
+    # A hard clamp at zero made the first reachable late-flight posture score
+    # exactly zero, so PPO had no direction in which to move the legs.
+    drop_midpoint = 0.20 * foot_drop_target
+    drop_scale = max(0.25 * foot_drop_target, 1.0e-6)
+    drop_score = torch.sigmoid((minimum_drop - drop_midpoint) / drop_scale)
+    level_score = 0.25 + 0.75 * torch.exp(
+        -((foot_z[:, 0] - foot_z[:, 1]) / 0.04).pow(2)
+    )
+
+    quat = torch.nan_to_num(asset.data.root_link_quat_w, nan=0.0)
+    up_z = torch.clamp(1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2)), -1.0, 1.0)
+    tilt = torch.acos(up_z)
+    upright_score = torch.exp(-((tilt / 0.40).pow(2)))
+    pitch_rate = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 1], nan=99.0).abs()
+    brake_score = 0.5 + 0.5 * torch.exp(-((pitch_rate / 6.0).pow(2)))
+    score = torch.where(
+        gate,
+        drop_score * torch.sqrt(upright_score * level_score) * brake_score,
+        torch.zeros_like(drop_score),
+    )
+    frontier = torch.maximum(env._roller_backflip_readiness_max, score)
+    delta = torch.clamp(frontier - env._roller_backflip_readiness_paid, min=0.0)
+    env._roller_backflip_readiness_max = frontier
+    env._roller_backflip_readiness_paid = torch.maximum(
+        env._roller_backflip_readiness_paid, frontier
+    )
+    return delta / env.step_dt
+
+
+def roller_backflip_post_landing_stability(
+    env: ManagerBasedRlEnv,
+    feet_sensor_name: str,
+    body_sensor_name: str,
+    stand_height: float,
+    takeoff_clearance: float,
+    landing_rotation: float,
+    joint_indices: list,
+    forward_speed_tolerance: float = 0.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward remaining upright and controlled after a valid full-flip landing."""
+    asset: Entity = env.scene[asset_cfg.name]
+    landed = _update_roller_backflip_state(
+        env, feet_sensor_name, body_sensor_name, stand_height,
+        takeoff_clearance, landing_rotation, asset_cfg,
+    )[7]
+    both_contact, _ = _roller_foot_contact_masks(env, feet_sensor_name)
+    pose = standing_composite_score(
+        env, target_height=stand_height, height_std=0.03,
+        upright_std=0.25, pose_std=0.45, joint_indices=joint_indices,
+        asset_cfg=asset_cfg,
+    )
+    lin_raw = torch.nan_to_num(asset.data.root_link_lin_vel_w, nan=99.0)
+    forward_excess = torch.clamp(
+        torch.abs(lin_raw[:, 0]) - forward_speed_tolerance, min=0.0
+    )
+    lin = torch.sqrt(
+        forward_excess.pow(2) + lin_raw[:, 1].pow(2) + lin_raw[:, 2].pow(2)
+    )
+    ang = torch.nan_to_num(asset.data.root_link_ang_vel_b, nan=99.0).norm(dim=-1)
+    quiet = torch.exp(-((lin / 0.25).pow(2)) - ((ang / 2.0).pow(2)))
+    return landed.float() * both_contact.float() * pose * quiet
+
+
+def roller_frontflip_rolling_recovery(
+    env: ManagerBasedRlEnv,
+    feet_sensor_name: str,
+    body_sensor_name: str,
+    stand_height: float,
+    takeoff_clearance: float,
+    landing_rotation: float,
+    forward_speed_tolerance: float = 1.5,
+    settle_seconds: float = 0.25,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Broad recovery shaping plus a durable rolling-stability latch.
+
+    Touchdown is not success: the robot must keep both skates down, recover to
+    within 15 degrees of upright, shed lateral/vertical and angular velocity,
+    and hold that state for ``settle_seconds``.  A broad geometric mean keeps a
+    useful gradient at the current ~28-degree post-touchdown tilt; a one-time
+    potential payment rewards genuine recovery progress without making a
+    transient lucky pose farmable.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    state = _update_roller_backflip_state(
+        env,
+        feet_sensor_name,
+        body_sensor_name,
+        stand_height,
+        takeoff_clearance,
+        landing_rotation,
+        asset_cfg,
+    )
+    landed = state[7]
+    invalid = state[8]
+    both_contact, _ = _roller_foot_contact_masks(env, feet_sensor_name)
+
+    quat = torch.nan_to_num(asset.data.root_link_quat_w, nan=0.0)
+    up_z = torch.clamp(
+        1.0 - 2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2)), -1.0, 1.0
+    )
+    tilt = torch.acos(up_z)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+        nan=0.0,
+    )
+    lin_raw = torch.nan_to_num(asset.data.root_link_lin_vel_w, nan=99.0)
+    forward_excess = torch.clamp(
+        torch.abs(lin_raw[:, 0]) - forward_speed_tolerance, min=0.0
+    )
+    controlled_lin = torch.sqrt(
+        forward_excess.pow(2) + lin_raw[:, 1].pow(2) + lin_raw[:, 2].pow(2)
+    )
+    ang = torch.nan_to_num(asset.data.root_link_ang_vel_b, nan=99.0).norm(dim=-1)
+
+    upright_score = torch.exp(-((tilt / 0.55).pow(2)))
+    height_score = torch.exp(-(((z - stand_height) / 0.05).pow(2)))
+    motion_score = torch.exp(
+        -((controlled_lin / 0.60).pow(2)) - ((ang / 5.0).pow(2))
+    )
+    score = torch.pow(
+        torch.clamp(upright_score * height_score * motion_score, min=0.0),
+        1.0 / 3.0,
+    )
+    gate = landed & both_contact & ~invalid
+    score = torch.where(gate, score, torch.zeros_like(score))
+
+    frontier = torch.maximum(env._roller_frontflip_recovery_max, score)
+    delta = torch.clamp(frontier - env._roller_frontflip_recovery_paid, min=0.0)
+    env._roller_frontflip_recovery_max = frontier
+    env._roller_frontflip_recovery_paid = torch.maximum(
+        env._roller_frontflip_recovery_paid, frontier
+    )
+
+    stable_now = (
+        gate
+        & (tilt <= math.radians(15.0))
+        & (controlled_lin <= 0.35)
+        & (ang <= 3.0)
+    )
+    env._roller_frontflip_stable_steps = torch.where(
+        stable_now,
+        env._roller_frontflip_stable_steps + 1,
+        torch.zeros_like(env._roller_frontflip_stable_steps),
+    )
+    required_steps = max(1, int(math.ceil(settle_seconds / env.step_dt)))
+    env._roller_frontflip_stable_latch |= (
+        env._roller_frontflip_stable_steps >= required_steps
+    )
+    return (
+        score
+        + 0.5 * delta / env.step_dt
+        + env._roller_frontflip_stable_latch.float()
+    )
+
+
 def roller_backflip_body_contact_cost(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
-    return _contact_any(env, sensor_name).float()
+    # RewardManager multiplies all terms by step_dt.  This term is followed by
+    # immediate termination, so undo that scaling to make the configured
+    # weight a true one-time terminal cost rather than a tiny per-step cost.
+    return _contact_any(env, sensor_name).float() / env.step_dt
+
+
+def roller_backflip_body_ground_contact(
+    env: ManagerBasedRlEnv, sensor_name: str
+) -> torch.Tensor:
+    """Terminate a flip as soon as the trunk or jaw contacts the terrain."""
+    return _contact_any(env, sensor_name)
 
 
 def roller_backflip_sagittal_cost(

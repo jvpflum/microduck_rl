@@ -43,6 +43,62 @@ from .microduck_velocity_rollers_env_cfg import (
     make_microduck_velocity_rollers_env_cfg,
     MicroduckRollersRlCfg,
 )
+from .microduck_velocity_sprint_env_cfg import (
+    make_microduck_velocity_sprint_env_cfg,
+    MicroduckSprintRlCfg,
+)
+from .microduck_velocity_race_env_cfg import (
+    make_microduck_velocity_race_env_cfg,
+    MicroduckRaceRlCfg,
+)
+from .microduck_velocity_race5_env_cfg import (
+    make_microduck_velocity_race5_env_cfg,
+    MicroduckRace5RlCfg,
+)
+from .microduck_velocity_race5_constrained_env_cfg import (
+    make_microduck_velocity_race5_constrained_env_cfg,
+    MicroduckRace5ConstrainedRlCfg,
+)
+from .microduck_speed_discovery_env_cfg import (
+    make_microduck_speed_discovery_env_cfg,
+    MicroduckSpeedDiscoveryRlCfg,
+)
+from .microduck_speed_straightening_env_cfg import (
+    make_microduck_speed_straightening_env_cfg,
+    MicroduckSpeedStraighteningRlCfg,
+)
+from .microduck_speed_retention_env_cfg import (
+    make_microduck_speed_retention_env_cfg,
+    MicroduckSpeedRetentionRlCfg,
+)
+from .microduck_speed_retention_boost_env_cfg import (
+    make_microduck_speed_retention_boost_env_cfg,
+    MicroduckSpeedRetentionBoostRlCfg,
+)
+from .microduck_speed_friction_transfer_env_cfg import (
+    make_microduck_speed_friction_transfer_env_cfg,
+    MicroduckSpeedFrictionTransferRlCfg,
+)
+from .microduck_speed_scout_transfer_env_cfg import (
+    make_microduck_speed_scout_transfer_env_cfg,
+    MicroduckSpeedScoutTransferRlCfg,
+)
+from .microduck_speed_scout_line_lock_env_cfg import (
+    make_microduck_speed_scout_line_lock_env_cfg,
+    MicroduckSpeedScoutLineLockRlCfg,
+)
+from .microduck_general_drive_env_cfg import (
+    make_microduck_general_drive_env_cfg,
+    MicroduckGeneralDriveRlCfg,
+)
+from .microduck_speed_command_breakthrough_env_cfg import (
+    make_microduck_speed_command_breakthrough_env_cfg,
+    MicroduckSpeedCommandBreakthroughRlCfg,
+)
+from .microduck_speed_residual_frontier_env_cfg import (
+    make_microduck_speed_residual_frontier_env_cfg,
+    MicroduckSpeedResidualFrontierRlCfg,
+)
 from .microduck_velocity_swizzle_env_cfg import (
     make_microduck_velocity_swizzle_env_cfg,
     MicroduckSwizzleRlCfg,
@@ -58,6 +114,38 @@ from .microduck_roller_hop_env_cfg import (
 from .microduck_roller_backflip_env_cfg import (
     make_microduck_roller_backflip_env_cfg,
     MicroduckRollerBackflipRlCfg,
+)
+from .microduck_roller_frontflip_launch_env_cfg import (
+    make_microduck_roller_frontflip_launch_env_cfg,
+    MicroduckRollerFrontFlipLaunchRlCfg,
+)
+from .microduck_roller_frontflip_centroidal_launch_env_cfg import (
+    make_microduck_roller_frontflip_centroidal_launch_env_cfg,
+    MicroduckRollerFrontFlipCentroidalLaunchRlCfg,
+)
+from .microduck_roller_frontflip_residual_launch_env_cfg import (
+    make_microduck_roller_frontflip_residual_launch_env_cfg,
+    MicroduckRollerFrontFlipResidualLaunchRlCfg,
+)
+from .microduck_roller_frontflip_flight_env_cfg import (
+    make_microduck_roller_frontflip_flight_env_cfg,
+    MicroduckRollerFrontFlipFlightRlCfg,
+)
+from .microduck_roller_frontflip_landing_env_cfg import (
+    make_microduck_roller_frontflip_landing_env_cfg,
+    MicroduckRollerFrontFlipLandingRlCfg,
+)
+from .microduck_roller_frontflip_integrated_env_cfg import (
+    make_microduck_roller_frontflip_integrated_env_cfg,
+    MicroduckRollerFrontFlipIntegratedRlCfg,
+)
+from .microduck_roller_frontflip_ballistic_env_cfg import (
+    make_microduck_roller_frontflip_ballistic_env_cfg,
+    MicroduckRollerFrontFlipBallisticRlCfg,
+)
+from .microduck_roller_frontflip_bridge_env_cfg import (
+    make_microduck_roller_frontflip_bridge_env_cfg,
+    MicroduckRollerFrontFlipBridgeRlCfg,
 )
 from .microduck_roller_slope_env_cfg import (
     make_microduck_roller_slope_env_cfg,
@@ -181,6 +269,124 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
+# Roller SPRINT — straight-line target-speed specialist.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Sprint-MicroDuck",
+    env_cfg=make_microduck_velocity_sprint_env_cfg(),
+    play_env_cfg=make_microduck_velocity_sprint_env_cfg(play=True),
+    rl_cfg=MicroduckSprintRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller RACE — fixed-distance, uncapped forward-speed specialist.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Race-MicroDuck",
+    env_cfg=make_microduck_velocity_race_env_cfg(),
+    play_env_cfg=make_microduck_velocity_race_env_cfg(play=True),
+    rl_cfg=MicroduckRaceRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller RACE5 — 5 mph target with a 10 mph simulation stretch cap.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Race5-MicroDuck",
+    env_cfg=make_microduck_velocity_race5_env_cfg(),
+    play_env_cfg=make_microduck_velocity_race5_env_cfg(play=True),
+    rl_cfg=MicroduckRace5RlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller RACE5 CONSTRAINED — V11 fine-tuning for speed that remains on line.
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Race5Constrained-MicroDuck",
+    env_cfg=make_microduck_velocity_race5_constrained_env_cfg(),
+    play_env_cfg=make_microduck_velocity_race5_constrained_env_cfg(play=True),
+    rl_cfg=MicroduckRace5ConstrainedRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller SPEED DISCOVERY — nominal physics and unconstrained chassis velocity.
+register_mjlab_task(
+    task_id="Mjlab-SpeedDiscovery-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_discovery_env_cfg(),
+    play_env_cfg=make_microduck_speed_discovery_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedDiscoveryRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Roller SPEED STRAIGHTENING — retain the fast gait while restoring race line.
+register_mjlab_task(
+    task_id="Mjlab-SpeedStraightening-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_straightening_env_cfg(),
+    play_env_cfg=make_microduck_speed_straightening_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedStraighteningRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedRetention-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_retention_env_cfg(),
+    play_env_cfg=make_microduck_speed_retention_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedRetentionRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedRetentionBoost-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_retention_boost_env_cfg(),
+    play_env_cfg=make_microduck_speed_retention_boost_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedRetentionBoostRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedFrictionTransfer-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_friction_transfer_env_cfg(),
+    play_env_cfg=make_microduck_speed_friction_transfer_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedFrictionTransferRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedScoutTransfer-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_scout_transfer_env_cfg(),
+    play_env_cfg=make_microduck_speed_scout_transfer_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedScoutTransferRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedScoutLineLock-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_scout_line_lock_env_cfg(),
+    play_env_cfg=make_microduck_speed_scout_line_lock_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedScoutLineLockRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-GeneralDrive-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_general_drive_env_cfg(),
+    play_env_cfg=make_microduck_general_drive_env_cfg(play=True),
+    rl_cfg=MicroduckGeneralDriveRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedCommandBreakthrough-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_command_breakthrough_env_cfg(),
+    play_env_cfg=make_microduck_speed_command_breakthrough_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedCommandBreakthroughRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-SpeedResidualFrontier-Flat-MicroDuck-Rollers",
+    env_cfg=make_microduck_speed_residual_frontier_env_cfg(),
+    play_env_cfg=make_microduck_speed_residual_frontier_env_cfg(play=True),
+    rl_cfg=MicroduckSpeedResidualFrontierRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
 # Roller SWIZZLE task — clean classic swizzle (symmetric, feet grounded).
 register_mjlab_task(
     task_id="Mjlab-Velocity-Swizzle-MicroDuck",
@@ -213,6 +419,80 @@ register_mjlab_task(
     env_cfg=make_microduck_roller_backflip_env_cfg(),
     play_env_cfg=make_microduck_roller_backflip_env_cfg(play=True),
     rl_cfg=MicroduckRollerBackflipRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Front-flip launch discovery — learn takeoff impulse before flight/landing.
+register_mjlab_task(
+    task_id="Mjlab-RollerFrontFlipLaunch-Flat-MicroDuck",
+    env_cfg=make_microduck_roller_frontflip_launch_env_cfg(),
+    play_env_cfg=make_microduck_roller_frontflip_launch_env_cfg(play=True),
+    rl_cfg=MicroduckRollerFrontFlipLaunchRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Exact-physics real-start launch refinement using whole-body momentum.
+register_mjlab_task(
+    task_id="Mjlab-RollerFrontFlipCentroidalLaunch-Flat-MicroDuck",
+    env_cfg=make_microduck_roller_frontflip_centroidal_launch_env_cfg(),
+    play_env_cfg=make_microduck_roller_frontflip_centroidal_launch_env_cfg(play=True),
+    rl_cfg=MicroduckRollerFrontFlipCentroidalLaunchRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Native-trajectory controller plus a small learned residual.  This preserves
+# the 227-degree launch frontier while PPO searches for contact repair.
+register_mjlab_task(
+    task_id="Mjlab-RollerFrontFlipResidualLaunch-Flat-MicroDuck",
+    env_cfg=make_microduck_roller_frontflip_residual_launch_env_cfg(),
+    play_env_cfg=make_microduck_roller_frontflip_residual_launch_env_cfg(play=True),
+    rl_cfg=MicroduckRollerFrontFlipResidualLaunchRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Front-flip flight/line-lock — resume a proven launch and prepare landing.
+register_mjlab_task(
+    task_id="Mjlab-RollerFrontFlipFlight-Flat-MicroDuck",
+    env_cfg=make_microduck_roller_frontflip_flight_env_cfg(),
+    play_env_cfg=make_microduck_roller_frontflip_flight_env_cfg(play=True),
+    rl_cfg=MicroduckRollerFrontFlipFlightRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Front-flip landing school — reverse curriculum from real descending states.
+register_mjlab_task(
+    task_id="Mjlab-RollerFrontFlipLanding-Flat-MicroDuck",
+    env_cfg=make_microduck_roller_frontflip_landing_env_cfg(),
+    play_env_cfg=make_microduck_roller_frontflip_landing_env_cfg(play=True),
+    rl_cfg=MicroduckRollerFrontFlipLandingRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Front-flip integration — launch, flight, clean landing, stable rolling exit.
+register_mjlab_task(
+    task_id="Mjlab-RollerFrontFlipIntegrated-Flat-MicroDuck",
+    env_cfg=make_microduck_roller_frontflip_integrated_env_cfg(),
+    play_env_cfg=make_microduck_roller_frontflip_integrated_env_cfg(play=True),
+    rl_cfg=MicroduckRollerFrontFlipIntegratedRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Front-flip launch/landing stitch using an exact-physics ballistic prior.
+register_mjlab_task(
+    task_id="Mjlab-RollerFrontFlipBallistic-Flat-MicroDuck",
+    env_cfg=make_microduck_roller_frontflip_ballistic_env_cfg(),
+    play_env_cfg=make_microduck_roller_frontflip_ballistic_env_cfg(play=True),
+    rl_cfg=MicroduckRollerFrontFlipBallisticRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Dedicated closed-loop continuation from the protected V69 launch frontier
+# into the protected V50 landing basin.
+register_mjlab_task(
+    task_id="Mjlab-RollerFrontFlipBridge-Flat-MicroDuck",
+    env_cfg=make_microduck_roller_frontflip_bridge_env_cfg(),
+    play_env_cfg=make_microduck_roller_frontflip_bridge_env_cfg(play=True),
+    rl_cfg=MicroduckRollerFrontFlipBridgeRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
@@ -282,6 +562,10 @@ _BACKLASH_TASKS = (
     ("Mjlab-GroundPick-Rough-Backlash-MicroDuck", make_microduck_ground_pick_env_cfg, {"rough": True}, MicroduckGroundPickRlCfg, _BL_ALLCOL),
     ("Mjlab-BallKick-Flat-Backlash-MicroDuck", make_microduck_ball_kick_env_cfg, {}, MicroduckBallKickRlCfg, _BL_ALLCOL),
     ("Mjlab-Velocity-Flat-Backlash-MicroDuck-Rollers", make_microduck_velocity_rollers_env_cfg, {}, MicroduckRollersRlCfg, _BL_ROLLERS),
+    ("Mjlab-Velocity-Sprint-Backlash-MicroDuck", make_microduck_velocity_sprint_env_cfg, {}, MicroduckSprintRlCfg, _BL_ROLLERS),
+    ("Mjlab-Velocity-Race-Backlash-MicroDuck", make_microduck_velocity_race_env_cfg, {}, MicroduckRaceRlCfg, _BL_ROLLERS),
+    ("Mjlab-Velocity-Race5-Backlash-MicroDuck", make_microduck_velocity_race5_env_cfg, {}, MicroduckRace5RlCfg, _BL_ROLLERS),
+    ("Mjlab-SpeedDiscovery-Flat-Backlash-MicroDuck-Rollers", make_microduck_speed_discovery_env_cfg, {}, MicroduckSpeedDiscoveryRlCfg, _BL_ROLLERS),
     ("Mjlab-Velocity-Swizzle-Backlash-MicroDuck", make_microduck_velocity_swizzle_env_cfg, {}, MicroduckSwizzleRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerCrouch-Flat-Backlash-MicroDuck", make_microduck_roller_crouch_env_cfg, {}, MicroduckRollerCrouchRlCfg, _BL_ROLLERS),
     ("Mjlab-RollerHop-Flat-Backlash-MicroDuck", make_microduck_roller_hop_env_cfg, {}, MicroduckRollerHopRlCfg, _BL_ROLLERS),

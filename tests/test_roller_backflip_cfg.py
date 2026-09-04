@@ -4,6 +4,7 @@ from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_roller_backflip_env_cfg import (
     DEMO_END_FRAME,
     DEMO_START_FRAME,
+    FRONT_FLIP_PITCH_SIGN,
     LANDING_ROTATION,
     MicroduckRollerBackflipRlCfg,
     TARGET_CLEARANCE,
@@ -18,6 +19,7 @@ def test_accepted_motion_drives_reverse_curriculum_without_waypoint_reward():
     assert len(demo["progress"]) == DEMO_END_FRAME - DEMO_START_FRAME
     assert demo["progress"][-1] > demo["progress"][0]
     assert demo["progress"][-1] >= LANDING_ROTATION
+    assert FRONT_FLIP_PITCH_SIGN == 1.0
     assert all(row[1] == 0.0 and row[3] == 0.0 and row[5] == 0.0 for row in demo["root_qvel"])
     assert all(len(row) == 14 for row in demo["joint_pos"])
 
@@ -45,11 +47,16 @@ def test_backflip_has_hard_airborne_rotation_and_clean_landing_gates():
     assert "tilt" not in rewards
     assert "hop_load_height" not in rewards
     assert any(sensor.name == "backflip_body_ground_contact" for sensor in cfg.scene.sensors)
+    assert cfg.terminations["non_skate_ground_contact"].func is microduck_mdp.roller_backflip_body_ground_contact
+    assert rewards["action_rate_l2"].func is microduck_mdp.roller_backflip_phase_action_rate_l2
+    assert rewards["backflip_demo_action_tracking"].func is microduck_mdp.roller_backflip_reference_action_tracking
 
 
 def test_backflip_assistance_reaches_zero_and_play_is_unassisted():
     cfg = make_microduck_roller_backflip_env_cfg()
-    stages = cfg.curriculum["backflip_spawn_assistance"].params["param_stages"]
+    curriculum = cfg.curriculum["backflip_spawn_assistance"]
+    assert curriculum.func is microduck_mdp.backflip_performance_curriculum
+    stages = curriculum.params["stages"]
     assert stages[0]["params"]["demo_prob"] > stages[-1]["params"]["demo_prob"]
     assert stages[-1]["params"]["assist_vz_range"] == (0.0, 0.0)
     assert stages[-1]["params"]["assist_omega_range"] == (0.0, 0.0)
@@ -68,4 +75,6 @@ def test_backflip_runner_is_bounded_and_hot_swappable():
         assert cfg.observations[group].terms["body_command"].params["dim"] == 6
     assert MicroduckRollerBackflipRlCfg.experiment_name == "roller_backflip"
     assert MicroduckRollerBackflipRlCfg.max_iterations == 2_500
-    assert MicroduckRollerBackflipRlCfg.save_interval == 100
+    assert MicroduckRollerBackflipRlCfg.save_interval == 25
+    assert MicroduckRollerBackflipRlCfg.algorithm.learning_rate == 3.0e-4
+    assert MicroduckRollerBackflipRlCfg.algorithm.clip_param == 0.20
